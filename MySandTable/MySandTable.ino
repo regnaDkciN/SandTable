@@ -19,6 +19,8 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 21-MAR-2025 JMC
+//   Added remote command handling in prep for possible external controller.
 // - 01-MAR-2025 JMC Original creation.
 //
 // Copyright (c) 2025, Joseph M. Corbett
@@ -93,6 +95,7 @@ const float    WIPE_RATIO       = 9.4;      // This constant should be changed b
 const uint16_t WIPE_RASTER_INC  = 4;        // This constant should be changed based on
                                             // ball size.  4 is a good value for use
                                             // with 3mm cylindrical magnet.
+const uint32_t REMOTE_TIMEOUT_MS = 10000;   // Remote command timeout (milliseconds).
 
 // Useful constants.
 const uint8_t IN              = 1;          // In/Out axis IN direction.
@@ -105,7 +108,7 @@ const float   FLOAT_PRECISION = 100.0;      // Use 2 significant digits for rand
 // Potentiometer related constants.
 const uint16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
 const uint16_t KNOB_MAX_VAL        = 1023;  // Maximum analog reading for knob.
-const uint16_t SPEED_DELAY_MIN_VAL = 25;    // Minimum axis moving delay value.
+const int16_t  SPEED_DELAY_MIN_VAL = 25;    // Minimum axis moving delay value.
                                             // This macro limits the maximum speed.
                                             // Original code used 50.  25 is obviously
                                             // twice as fast, but it is also twice
@@ -113,9 +116,9 @@ const uint16_t SPEED_DELAY_MIN_VAL = 25;    // Minimum axis moving delay value.
                                             // be turned down to reduce noise if
                                             // desired, or this value could be
                                             // increased to 50 or 60.
-const uint16_t SPEED_DELAY_MAX_VAL = 500;   // Maximum axis speed delay value.
-const uint16_t BRIGHTNESS_MIN_VAL  = 255;   // Minimum LED brightness value.
-const uint16_t BRIGHTNESS_MAX_VAL  = 0;     // Maximum LED brightness value.
+const int16_t  SPEED_DELAY_MAX_VAL = 500;   // Maximum axis speed delay value.
+const int16_t  BRIGHTNESS_MIN_VAL  = 255;   // Minimum LED brightness value.
+const int16_t  BRIGHTNESS_MAX_VAL  = 0;     // Maximum LED brightness value.
 
 // Shape algorithm limits.
 const uint16_t MAX_CYCLES      = 50;        // Maximum cycles to generate when drawing.
@@ -208,8 +211,19 @@ volatile int16_t InLimit      = 0;      // Inner limit where MotorRatios() will
                                         // change direction or finish.
 volatile int16_t OutLimit     = MAX_SCALE_I; // Outer limit where MotorRatios()
                                         // will change direction or finish.
-
-
+int16_t          SpeedDelay   = SPEED_DELAY_MAX_VAL; 
+                                        // Active speed delay value.
+bool             RemoteSpeedDelay = false; // 'true' if remotely setting speed.
+int16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
+bool             RemoteBrightness = false; 
+                                        // 'true' if remotely setting brightness.
+bool             RemotePause  = false;  // 'true' if pausing motionremotely.
+bool             AbortShape   = false;  // 'true' if aborting ghe current shape.
+uint16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
+bool             RandomSeedChanged = false;
+                                        // 'true' when random seed has been change.
+                                        
+                                        
 /////////////////////////////////////////////////////////////////////////////////
 // F O R W A R D   D E C L A R A T I O N S
 /////////////////////////////////////////////////////////////////////////////////
@@ -283,11 +297,11 @@ public:
         m_pShape = pShape;
         m_Delay  = delay;
         m_LastCycle = 0;
-    }
+    } // End constructor.
 
 
     /////////////////////////////////////////////////////////////////////////////
-    // MakeShape
+    // MakeShape()
     //
     // This method enforces the delay between consecutive executions of pShape().
     //
@@ -313,7 +327,19 @@ public:
         }
         // Let the caller know if we executed or not.
         return retval;
-    }
+    } // End MakeShape().
+    
+    /////////////////////////////////////////////////////////////////////////////
+    // Reset()
+    //
+    // This method resets the last cycle value.  It is mainly used when a new
+    // random seed is set so that a previously generated sequence can be 
+    // identically repeated.
+    /////////////////////////////////////////////////////////////////////////////
+    void Reset()
+    {
+        m_LastCycle = 0;
+    } // End Reset().
 
 private:
     // Private methods so the user can't call them.
@@ -399,6 +425,124 @@ const Coordinate JMCPlot[] =
 /////////////////////////////////////////////////////////////////////////////////
 // S U P P O R T   F U N C T I O N S
 /////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////
+// HandleRemoteCommands()
+//
+// Checks for and handles remote commands froom the serial port.
+//
+// Valid commands can be either upper or lower case, and include:
+//  'F' (FASTER)      Increase the speed.
+//  'S' (SLOWER)      Decreases the speed.
+//  'Q'               Restores speed control to the local speed pot.
+//  'B' (BRIGHTER)    Increases the LED brightness.
+//  'D' (DARKER)      Decreases the LED brightness.
+//  'L'               Restores LED control to the local LED pot.
+//  'P' (PAUSE)       Pauses motion.
+//  'U' (UNPAUSE)     Unpauses motion.
+//  'R 'newSeed'
+//      (RANDOM SEED) Re-seeds the random number generator with the value of
+//                    'newSeed', homes the axes and clears the board.
+//  'N' (NEXT)        Aborts the current shape and starts the next one.
+//  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the 
+//                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
+//                    remote settings get cleared and local control is restored.
+/////////////////////////////////////////////////////////////////////////////////
+void HandleRemoteCommands()
+{
+    // Keep track of the last time we received a command.
+    static uint32_t lastMessageMs = millis();
+    
+    // See if it's been too long since our last serial message.
+    // If so, then undo any remote controls that may be in effect.
+    if (millis() - lastMessageMs > REMOTE_TIMEOUT_MS)
+    {
+        RemoteSpeedDelay = false;
+        RemoteBrightness = false;
+        RemotePause      = false;
+    }
+
+    // See if we got any messages.
+    if (Serial.available() > 0)
+    {
+        // Setup a buffer to hold any received commands.
+        const uint16_t BUFLEN = 14;
+        char buf[BUFLEN];
+        uint16_t len = 0;
+        
+        // Got a message.  Update our timeout base.
+        lastMessageMs = millis();
+        
+        // Handle the remote command.
+        buf[0] = Serial.read();
+        switch (toupper(buf[0]))
+        {
+            // Increase speed.
+            case 'F':
+                SpeedDelay -= 20;
+                RemoteSpeedDelay = true;
+            break;
+            // Decrease speed.
+            case 'S':
+                SpeedDelay += 20;
+                RemoteSpeedDelay = true;
+            break;
+            // Restore local control of speed;
+            case 'Q':
+                SpeedDelay = 0;
+                RemoteSpeedDelay = false;
+            break;
+            // Increase brightness.
+            case 'B':
+                Brightness += 5;
+                RemoteBrightness = true;
+            break;
+            // Decrease brightness.
+            case 'D':
+                Brightness -= 5;
+                RemoteBrightness = true;
+            break;
+            // Restore local control of brightness.
+            case 'L':
+                RemoteBrightness = false;
+            break;
+            // Pause motion.
+            case 'P':
+                RemotePause = true;
+            break;
+            // Unpause motion.
+            case 'U':
+                RemotePause = false;
+            break;
+            // Start with a new random seed.
+            case 'R':
+                len = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
+                buf[len] = '\0';
+                RandomSeed = atol(buf);
+                randomSeed(RandomSeed);
+                LOG_U(LOG_DEBUG, RandomSeed);
+                LOG_U(LOG_DEBUG, "\n");
+                RandomSeedChanged = true;
+                // Abort the current shape since we want the new random value to
+                // take effect at the beginning of a shape.
+                AbortShape = true;
+                break;
+            // Next shape - Abort the current shape and start the next.
+            case 'N':
+                AbortShape = true;
+            break;
+            // Keep alive - do nothing.
+            case 'K':
+            break;
+            // Default - Not anything we know about.  Just ignore it.
+            default:
+            break;
+        }
+        SpeedDelay = constrain(SpeedDelay, SPEED_DELAY_MIN_VAL, SPEED_DELAY_MAX_VAL);
+        Brightness = constrain(Brightness, BRIGHTNESS_MAX_VAL, BRIGHTNESS_MIN_VAL);
+    }
+} // End HandleRemoteCommands().
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
@@ -917,7 +1061,7 @@ void GotoXY(float targetX, float targetY)
         float incrementY = dy / steps;
 
         // Break the move into manageable pieces.
-        for (uint16_t i = 0; i < steps; i++)
+        for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
         {
             // Calculate next intermediate point to move to.
             newX += incrementX;
@@ -970,42 +1114,56 @@ void RotateGotoXY(float targetX, float targetY, float angle)
 /////////////////////////////////////////////////////////////////////////////////
 // UpdateLeds()
 //
-// Reads the brightness pot and sets the LED brightness accordingly.
+// Update the brightness of the LEDs.  If remote LED control is active, then
+// just set the brightness.  Otherwise, read the brightness pot and set the LED
+// brightness accordingly.
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateLeds()
 {
-    // Pot on the left BRIGHTNESS.
-    uint16_t brightnessKnobVal = analogRead(BRIGHTNESS_POT_PIN);
-    uint16_t brightness = map(brightnessKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
-                              BRIGHTNESS_MAX_VAL, BRIGHTNESS_MIN_VAL);
-    analogWrite(LIGHTS_PIN, brightness);
+    // Only read left BRIGHTNESS pot if we're not being controlled remotely.
+    if (!RemoteBrightness)
+    {
+        int16_t brightnessKnobVal = analogRead(BRIGHTNESS_POT_PIN);
+        Brightness = map(brightnessKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
+                         BRIGHTNESS_MAX_VAL, BRIGHTNESS_MIN_VAL);
+    }
+    analogWrite(LIGHTS_PIN, Brightness);
 } // End UpdateLeds().
 
 
 /////////////////////////////////////////////////////////////////////////////////
 // UpdateSpeeds()
 //
-// Reads the speed pot and sets the speed delay values accordingly.  Returns an
-// indication of whether or not motors should run.
+// Update the servo speeds.  If remote speed control is active, then just set
+// the speeds.  Otherwise, read the speed pot and set the speed delay values
+// accordingly.  Returns an indication of whether or not motors should run.
 //
 // Returns:
 //    Returns 'true' if motors should continue running.  Returns 'false' otherwise.
 /////////////////////////////////////////////////////////////////////////////////
 bool UpdateSpeeds()
 {
-    // Pot on the right for drawing speed or delay.
-    uint16_t speedKnobVal = analogRead(SPEED_POT_PIN);
-    uint16_t speedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
-                              SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
+    // Assume we're going to keep running (i.e. not pausing).
+    bool keepRunning = true;
+    
+    // Only read the right SPEED pot if we're not being controlled remotely.
+    if (!RemoteSpeedDelay)    
+    {
+        // Pot on the right for drawing speed or delay.
+        uint16_t speedKnobVal = analogRead(SPEED_POT_PIN);
+        SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
+                         SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
+        keepRunning = (speedKnobVal != KNOB_MIN_VAL);
+    }
 
     // Set the values atomically.
     noInterrupts();
-    RotDelay   = speedDelay * RotSpeedFactor;
-    InOutDelay = speedDelay * InOutSpeedFactor;
+    RotDelay   = SpeedDelay * RotSpeedFactor;
+    InOutDelay = SpeedDelay * InOutSpeedFactor;
     interrupts();
 
     // Return an indication of whether or not motors should run.
-    return speedKnobVal != KNOB_MIN_VAL;
+    return keepRunning;
 } // End UpdateSpeeds().
 
 
@@ -1020,16 +1178,22 @@ bool UpdateSpeeds()
 /////////////////////////////////////////////////////////////////////////////////
 void ReadPots()
 {
+    // Perform any requested remote commands.
+    HandleRemoteCommands();
+    
     // Update the LED brightness based on pot input.
     UpdateLeds();
 
     // Update the speeds based on pot input and check for pause.
     // If pause, wait for the pause to go away.
-    while (!UpdateSpeeds())
+    while (!UpdateSpeeds() || RemotePause)
     {
         // We are in the pause state, disable motor ISRs execution.
         Pausing = true;
 
+        // Keep checking for remote commands.
+        HandleRemoteCommands();
+        
         // Continue to update the LED brightness.
         UpdateLeds();
     }
@@ -1176,7 +1340,7 @@ void Circle(uint16_t numLobes, uint16_t xSize, uint16_t ySize, float rotation)
     ySize    = constrain(ySize, MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE);
 
     // Loop to create the curve.
-    for (uint16_t i = 0; i <= SPIRO_NUM_POINTS; i++)
+    for (uint16_t i = 0; (i <= SPIRO_NUM_POINTS)  && !AbortShape; i++)
     {
         float angle = SPIRO_ANGLE_BASE * (float)i;
         float x = (float)xSize * cosf(angle);
@@ -1237,7 +1401,7 @@ void EllipseSeries()
     GenerateSeriesSteps(xSize, steps, sizeInc, rotInc);
 
     // Loop to create the ellipse series.
-    for (uint16_t i = 0; i < steps; i++)
+    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         LOG_F(LOG_INFO, "Circle(%d,%d,%d,", lobes, xSize, ySize);
         LOG_U(LOG_INFO, RtoD(rot));
@@ -1309,7 +1473,8 @@ void ClearLeftRight(float rotation = 0.0)
     LOG_U(LOG_INFO, ")\n");
 
     // Clear from left and right
-    for (int16_t i = -(int16_t)MAX_SCALE_I; i <= (int16_t)MAX_SCALE_I; i += WIPE_RASTER_INC)
+    for (int16_t i = -(int16_t)MAX_SCALE_I; 
+         (i <= (int16_t)MAX_SCALE_I) && !AbortShape; i += WIPE_RASTER_INC)
     {
         ReadPots();
 
@@ -1412,7 +1577,7 @@ void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, ui
     float offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint32_t i = 0; i <= res * cycles; i++)
+    for (uint32_t i = 0; (i <= res * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -1484,7 +1649,7 @@ void Heart(uint16_t size, float rotation, uint16_t res)
     float baseAngle = PI_X_2 / (float)res;
 
     // Loop to create the heart.
-    for (uint16_t i = 0; i <= res; i++)
+    for (uint16_t i = 0; (i <= res) && !AbortShape; i++)
     {
         float angle = baseAngle * (float)i;
         float x = scale * powf(sinf(angle), 3.0);
@@ -1519,7 +1684,7 @@ void HeartSeries()
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the Heart series.
-    for (uint16_t i = 0; i < steps; i++)
+    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         LOG_F(LOG_INFO, "Heart(%d,", size);
         LOG_U(LOG_INFO, RtoD(rot));
@@ -1623,7 +1788,7 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
     // MRPointCount equals 0;
-    while (RotOn || InOutOn)
+    while ((RotOn || InOutOn) && !AbortShape)
     {
         ReadPots();
         CalculateXY();       // Keep track of the location as it moves.
@@ -1741,7 +1906,7 @@ void PlotShapeArray(const Coordinate shape[], uint16_t size, bool rotate)
     float rotation = (rotate ? (RadAngle - atan2f(shape[0].y, shape[0].x)) : 0.0);
 
     // Simply loop through the array, plotting each Coordinate.
-    for (uint16_t i = 0; i < size; i++)
+    for (uint16_t i = 0; (i < size) && !AbortShape; i++)
     {
         // Update LEDs and speeds.
         ReadPots();
@@ -1825,7 +1990,7 @@ void Polygon(uint16_t numSides, uint16_t size, float rotation)
     float scale = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
     // Loop to create the (possibly rotated) polygon.
-    for (uint16_t i = 0; i <= numSides; i++)
+    for (uint16_t i = 0; (i <= numSides) && !AbortShape; i++)
     {
         float angle = rotation + (PI_X_2 * (float)i) / (float)numSides;
         GotoXY(scale * cosf(angle), scale * sinf(angle));
@@ -1854,7 +2019,7 @@ void PolygonSeries()
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the polygon series.
-    for (uint16_t i = 0; i < steps; i++)
+    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         LOG_F(LOG_INFO, "Polygon(%d,%d,", sides, size);
         LOG_U(LOG_INFO, RtoD(rot));
@@ -1901,7 +2066,7 @@ void Rose(uint16_t num, uint16_t denom, uint16_t xSize, uint16_t ySize, uint16_t
     float baseAngle2 = PI * denom / res / num;
 
     // Loop to create the curve.
-    for (uint16_t i = 0; i <= cycles; i++)
+    for (uint16_t i = 0; (i <= cycles) && !AbortShape; i++)
     {
         if (LOG_CYCLES && (i % res == 0))
         {
@@ -1979,7 +2144,7 @@ void Spirograph (uint16_t fixedR, uint16_t r, uint16_t a)
     float offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint32_t i = 0; i <= SPIRO_NUM_POINTS * cycles; i++)
+    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -2060,7 +2225,7 @@ void Spirograph2(uint16_t fixedR, uint16_t r1, uint16_t r2, uint16_t d)
     float offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint32_t i = 0; i <= SPIRO_NUM_POINTS * cycles; i++)
+    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -2150,7 +2315,7 @@ void SpirographWithSquare(uint16_t fixedR, uint16_t s, uint16_t d)
     float offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint32_t i = 0; i <= SPIRO_NUM_POINTS * cycles; i++)
+    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -2231,7 +2396,7 @@ void Star(uint16_t numPoints, float ratio, uint16_t size, float rotation)
     size = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
     // Loop to create the (possibly rotated) star.
-    for (uint16_t i = 0; i <= numPoints * 2; i++)
+    for (uint16_t i = 0; (i <= numPoints * 2) && !AbortShape; i++)
     {
         float angle = rotation + (PI * (float)i) / (float)numPoints;
         float scale = size * ((i % 2) ? ratio : 1.0);
@@ -2262,7 +2427,7 @@ void StarSeries()
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the Star series.
-    for (uint16_t i = 0; i < steps; i++)
+    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         LOG_F(LOG_INFO, "Star(%d,", points);
         LOG_U(LOG_INFO, ratio);
@@ -2305,12 +2470,12 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
     GotoXY(scale * cosf(rotation), scale * sinf(rotation));
 
     // Loop through all useful skip values.
-    for (uint16_t skip = initialSkip; skip <= numNodes / 2; skip++)
+    for (uint16_t skip = initialSkip; (skip <= numNodes / 2) && !AbortShape; skip++)
     {
         LOG_F(LOG_DEBUG, "skip %d\n", skip);
         // Loop to visit each node with each skip value.
         for (uint16_t nodesVisited = 0, startNode = 0;
-             nodesVisited < numNodes; startNode++)
+             (nodesVisited < numNodes) && !AbortShape; startNode++)
         {
             uint16_t node = startNode;
             LOG_F(LOG_DEBUG, "start node %d\n", node);
@@ -2322,7 +2487,7 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
                 GotoXY(scale * cosf(angle), scale * sinf(angle));
                 node += skip;
                 nodesVisited++;
-            } while ((node % numNodes) != startNode);
+            } while (((node % numNodes) != startNode) && !AbortShape);
 
             // Return to the starting node.
             angle = rotation + (PI_X_2 * startNode) / (float)numNodes;
@@ -2403,19 +2568,17 @@ ShapeInfo RandomShapes[] =
 //
 // Randomly selects a randomization function to execute.  The RandomShapes array
 // contains a list of ShapeInfo instances that contain a pointer to a randomization
-// functions and its corresponding skip value.  GenerateRandomShape() randomly selects one
-// of the ShapeInfo entries for possible execution.  It calls the corresponding
+// function and its corresponding skip value.  It calls the corresponding
 // ShapeInfo.MakeShape() method which determines whether or not it is ok to
 // execute the corresponding randomization function based on the current iteration
-// value. If the shape function executes then MakeShape() returns a value
-// of 'true'.  In this case, GenerateRandomShape() increments the iteration count.  If the
-// shape function does not execute, and returns 'false', the iteration count is
-// not incremented, and another random shape is considered
+// value.  If the shape function executes then MakeShape() returns a value
+// of 'true'.  In this case, GenerateRandomShape() increments the iteration count.
+// If the shape function does not execute, and returns 'false', the iteration
+// count is not incremented, and another random shape is considered.
 /////////////////////////////////////////////////////////////////////////////////
 void GenerateRandomShape()
 {
     // Keep track of our iteration.
-    static uint16_t iteration = 0;
     uint16_t        index = 0;
 
     // Select functions to execute at random till we find one that will actually
@@ -2426,12 +2589,20 @@ void GenerateRandomShape()
         index = random(0, sizeof(RandomShapes) / sizeof(RandomShapes[0]));
 
     // Call the random function, and try another function if it was too soon.
-    } while (!RandomShapes[index].MakeShape(iteration));
+    } while (!RandomShapes[index].MakeShape(ShapeIteration));
 
     // Increment the iteration count since we just executed something.
-    iteration++;
+    ShapeIteration++;
     EndPlot();
 } // End GenerateRandomShape();
+
+void ResetShapes()
+{
+    for (uint16_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
+    {
+        RandomShapes[i].Reset();
+    }
+}
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2510,7 +2681,18 @@ void setup()
     // interesting sequence.
     LOG_U(LOG_ALWAYS, "Seed = ");
     LOG_U(LOG_ALWAYS, RandomSeed);
-
+    
+    // Initialize runtime variables to safe values.
+    SpeedDelay        = SPEED_DELAY_MAX_VAL;
+    RemoteSpeedDelay  = false;
+    Brightness        = BRIGHTNESS_MIN_VAL;
+    RemoteBrightness  = false;
+    RemotePause       = false;
+    AbortShape        = false;
+    ShapeIteration    = 0;
+    RandomSeedChanged = false;
+    ResetShapes();
+    
     // Announce that we are ready to go.
     LOG_U(LOG_ALWAYS, "\nREADY\n");
 } // End setup().
@@ -2542,6 +2724,19 @@ void loop()
     // Generate a random shape.
     GenerateRandomShape();
     ReadPots();
+    
+    // If we were aborting the previous shape, we're done now.
+    AbortShape = false;
+    
+    // Start over with clean board if the random seed has changed.
+    if (RandomSeedChanged)
+    {
+        Home();
+        ClearFromIn();
+        ResetShapes();
+        RandomSeedChanged = false;
+    }
+    
     delay(100);
 } // End loop().
 
