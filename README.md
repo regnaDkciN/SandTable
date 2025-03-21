@@ -423,7 +423,7 @@ ShapeInfo RandomShapes[] =
 * `RandomShapes[]` entries consist of a pointer to the associated function, and a delay value.  The delay value specifies the number of execution cycles that must elapse between executions of the shape.  That is, some shapes should not be generated very often.  This value keeps the shape from occurring too frequently.  For example, wipes should be done rarely, so the delay value used for `RandomWipe()` is 30.  This means that at least 30 other shapes must be displayed before another wipe occurs.
 
 ## Random Seed 
-At the end of `setup()`, a seed for the random number generator is fed to `randomSeed()`.  This seed value is based on the number of microseconds since power-up.  This helps to insure that each power-up will generate unique patterns.  The random seed value is logged to the serial port so that it may be saved if needed.  A future update may add the ability to manually set the random number generator to a previously reported value in order to duplicate a particular run pattern.
+At the end of `setup()`, a seed for the random number generator is fed to `randomSeed()`.  This seed value is based on the number of microseconds since power-up.  This helps to insure that each power-up will generate unique patterns.  The random seed value is logged to the serial port so that it may be saved if needed.  A serial port interface has been added which  allows re-seeding the random number generator to any value.  This provides the ability to manually set the random number generator to a previously reported value in order to duplicate a particular run pattern.
 ```
     // Seed the random number generator.
     RandomSeed = micros();
@@ -450,6 +450,24 @@ The first execution of `loop()` is setup to wipe the board, then display my init
     }
 ```
 
+## Remote Command Interface
+Limited capability to control the sand table remotely via the serial port was added.  The following commands are accepted (see HandleRemoteCommands() for implementation):
+* 'F' (FASTER)      Increase the speed.
+* 'S' (SLOWER)      Decreases the speed.
+* 'Q'               Restores speed control to the local speed pot.
+* 'B' (BRIGHTER)    Increases the LED brightness.
+* 'D' (DARKER)      Decreases the LED brightness.
+* 'L'               Restores LED control to the local LED pot.
+* 'P' (PAUSE)       Pauses motion.
+* 'U' (UNPAUSE)     Unpauses motion.
+* 'R 'newSeed'
+    (RANDOM SEED) Re-seeds the random number generator with the value of
+                  'newSeed', homes the axes and clears the board.
+* 'N' (NEXT)        Aborts the current shape and starts the next one.
+* 'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the 
+                  serial port after REMOTE_TIMEOUT_MS milliseconds, then all
+                  remote settings get cleared and local control is restored.
+ 
 # Conclusions
 This has been a great project.  I am very happy with the results.  It gave me a chance to learn more about laser cutting and some useful tools for it.  I would recommend it to anyone with moderate electronics skills.  However, there are a few things I would consider doing differently if I were to make another sand table.
 * The Arduino Uno is somewhat under powered for this project.  It is relatively slow by today's standards, and is very memory limited.  For example, MySandTable.ino uses 90% of the Arduino's memory, and runs a little choppy on some of the more complex shapes.  There are two ways to approach this problem.  First, one could offload shape generation code to another processor which could communicate with the Arduino via its USB port.  The Arduino would then only contain communication and motor driver code.  This is the path taken by [another sand table design I've seen](https://github.com/DIY-Machines/Kinetic-Sand-Art-Table).  This is not a bad approach, but it is more expensive, and requires maintaining 2 separate code bases.  I prefer a second path which would be to use a better processor.  The [Raspberry Pi Pico 2 W](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) would be a great choice due to its low price, great speed, and ample memory.  The problem with this is that at present I could not find a CNC shield that uses the Pico.  I would consider creating one myself since I have some PC board design experience.
