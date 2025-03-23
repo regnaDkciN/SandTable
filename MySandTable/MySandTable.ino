@@ -19,8 +19,13 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 23-MAR-2025 JMC
+//   - Reworked shape call logging.
+//   - Renamed EndPlot() to EndShape().
+//   - Added EndSeries() to announce the end of a series.
+//   - Added RandomLines().
 // - 21-MAR-2025 JMC
-//   Added remote command handling in prep for possible external controller.
+//   - Added remote command handling in prep for possible external controller.
 // - 01-MAR-2025 JMC Original creation.
 //
 // Copyright (c) 2025, Joseph M. Corbett
@@ -179,6 +184,8 @@ const uint16_t MIN_HEART_SIZE   = MAX_SCALE_I / 4; // Minimum heart size.
 const uint16_t MIN_HEART_RES    = 8;        // Minimum heart size.
 const uint16_t MAX_HEART_RES    = 128;      // Minimum heart size.
 
+const uint16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lines.
+const uint16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
 
 
 
@@ -211,19 +218,19 @@ volatile int16_t InLimit      = 0;      // Inner limit where MotorRatios() will
                                         // change direction or finish.
 volatile int16_t OutLimit     = MAX_SCALE_I; // Outer limit where MotorRatios()
                                         // will change direction or finish.
-int16_t          SpeedDelay   = SPEED_DELAY_MAX_VAL; 
+int16_t          SpeedDelay   = SPEED_DELAY_MAX_VAL;
                                         // Active speed delay value.
 bool             RemoteSpeedDelay = false; // 'true' if remotely setting speed.
 int16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
-bool             RemoteBrightness = false; 
+bool             RemoteBrightness = false;
                                         // 'true' if remotely setting brightness.
 bool             RemotePause  = false;  // 'true' if pausing motionremotely.
 bool             AbortShape   = false;  // 'true' if aborting ghe current shape.
 uint16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
 bool             RandomSeedChanged = false;
                                         // 'true' when random seed has been change.
-                                        
-                                        
+
+
 /////////////////////////////////////////////////////////////////////////////////
 // F O R W A R D   D E C L A R A T I O N S
 /////////////////////////////////////////////////////////////////////////////////
@@ -328,12 +335,12 @@ public:
         // Let the caller know if we executed or not.
         return retval;
     } // End MakeShape().
-    
+
     /////////////////////////////////////////////////////////////////////////////
     // Reset()
     //
     // This method resets the last cycle value.  It is mainly used when a new
-    // random seed is set so that a previously generated sequence can be 
+    // random seed is set so that a previously generated sequence can be
     // identically repeated.
     /////////////////////////////////////////////////////////////////////////////
     void Reset()
@@ -444,7 +451,7 @@ const Coordinate JMCPlot[] =
 //      (RANDOM SEED) Re-seeds the random number generator with the value of
 //                    'newSeed', homes the axes and clears the board.
 //  'N' (NEXT)        Aborts the current shape and starts the next one.
-//  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the 
+//  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the
 //                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
 //                    remote settings get cleared and local control is restored.
 /////////////////////////////////////////////////////////////////////////////////
@@ -452,7 +459,7 @@ void HandleRemoteCommands()
 {
     // Keep track of the last time we received a command.
     static uint32_t lastMessageMs = millis();
-    
+
     // See if it's been too long since our last serial message.
     // If so, then undo any remote controls that may be in effect.
     if (millis() - lastMessageMs > REMOTE_TIMEOUT_MS)
@@ -469,10 +476,10 @@ void HandleRemoteCommands()
         const uint16_t BUFLEN = 14;
         char buf[BUFLEN];
         uint16_t len = 0;
-        
+
         // Got a message.  Update our timeout base.
         lastMessageMs = millis();
-        
+
         // Handle the remote command.
         buf[0] = Serial.read();
         switch (toupper(buf[0]))
@@ -1145,9 +1152,9 @@ bool UpdateSpeeds()
 {
     // Assume we're going to keep running (i.e. not pausing).
     bool keepRunning = true;
-    
+
     // Only read the right SPEED pot if we're not being controlled remotely.
-    if (!RemoteSpeedDelay)    
+    if (!RemoteSpeedDelay)
     {
         // Pot on the right for drawing speed or delay.
         uint16_t speedKnobVal = analogRead(SPEED_POT_PIN);
@@ -1180,7 +1187,7 @@ void ReadPots()
 {
     // Perform any requested remote commands.
     HandleRemoteCommands();
-    
+
     // Update the LED brightness based on pot input.
     UpdateLeds();
 
@@ -1193,7 +1200,7 @@ void ReadPots()
 
         // Keep checking for remote commands.
         HandleRemoteCommands();
-        
+
         // Continue to update the LED brightness.
         UpdateLeds();
     }
@@ -1244,7 +1251,7 @@ void SetSpeedFactors(float rotFactor, float inOutFactor)
 
 
 /////////////////////////////////////////////////////////////////////////////////
-// EndPlot()
+// EndShape()
 //
 // This function is normally called at the end of each shape execution.  It
 // normally just delays for 3 seconds then returns.  However, it may also aid
@@ -1252,8 +1259,11 @@ void SetSpeedFactors(float rotFactor, float inOutFactor)
 // macro, execution will stop at the end of every shape until the speed pot is
 // set to zero then non-zero.
 /////////////////////////////////////////////////////////////////////////////////
-inline void EndPlot()
+void EndShape()
 {
+    // Announce that the shape is done.
+    LOG_U(LOG_INFO, "End Shape\n");
+
     // If PAUSE_ON_DONE is 'false', then this entire block will be optimized out.
     if (PAUSE_ON_DONE)
     {
@@ -1280,7 +1290,19 @@ inline void EndPlot()
         delay(10);
         ReadPots();
     }
-} // End EndPlot().
+} // End EndShape().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// EndSeries()
+//
+// This function is called at the end of each series execution.  It simply
+// announces that the series is done.
+/////////////////////////////////////////////////////////////////////////////////
+void EndSeries()
+{
+    LOG_U(LOG_INFO, "End Series\n");
+} // End EndSeries().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1310,6 +1332,9 @@ void GenerateSeriesSteps(uint16_t size, uint16_t &steps, uint16_t &sizeInc, floa
     sizeInc = max(sizeInc, MIN_SERIES_INC);
     steps   = 1 + (MAX_SCALE_I - size) / sizeInc;
     rotInc  = RandomFloat(0.0, DtoR(MAX_SERIES_ANGLE));
+    LOG_F(LOG_INFO, "(%d,%d,%d,", size, steps, sizeInc);
+    LOG_U(LOG_INFO, rotInc);
+    LOG_U(LOG_INFO, "\n");
 } // End GenerateSeriesSteps().
 
 
@@ -1339,6 +1364,11 @@ void Circle(uint16_t numLobes, uint16_t xSize, uint16_t ySize, float rotation)
     xSize    = constrain(xSize, MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE);
     ySize    = constrain(ySize, MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE);
 
+    // Show our call.
+    LOG_F(LOG_INFO, "Circle(%d,%d,%d,", numLobes, xSize, ySize);
+    LOG_U(LOG_INFO, RtoD(rotation));
+    LOG_U(LOG_INFO, ")\n");
+
     // Loop to create the curve.
     for (uint16_t i = 0; (i <= SPIRO_NUM_POINTS)  && !AbortShape; i++)
     {
@@ -1363,11 +1393,6 @@ void RandomCircle()
     uint16_t ySize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
     float    rot   = RandomFloat(0.0, PI);
 
-    // Show our call.
-    LOG_F(LOG_INFO, "Circle(%d,%d,%d,", lobes, xSize, ySize);
-    LOG_U(LOG_INFO, RtoD(rot));
-    LOG_U(LOG_INFO, ")\n");
-
     // Make the call to Circle().
     Circle(lobes, xSize, ySize, rot);
 } // End RandomCircle().
@@ -1380,7 +1405,7 @@ void RandomCircle()
 /////////////////////////////////////////////////////////////////////////////////
 void EllipseSeries()
 {
-    LOG_U(LOG_INFO, "EllipseSeries()\n");
+    LOG_U(LOG_INFO, "EllipseSeries");
 
     // Usefull constants.
     const uint16_t MIN_LOBES = 1;   // Need at least one lobe.
@@ -1403,16 +1428,13 @@ void EllipseSeries()
     // Loop to create the ellipse series.
     for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
-        LOG_F(LOG_INFO, "Circle(%d,%d,%d,", lobes, xSize, ySize);
-        LOG_U(LOG_INFO, RtoD(rot));
-        LOG_U(LOG_INFO, ")\n");
-
         // Make the call to Circle() and increment our size and rotation.
         Circle(lobes, xSize, ySize, rot);
         xSize += sizeInc;
         ySize += sizeInc;
         rot += rotInc;
     }
+    EndSeries();
 } // End EllipseSeries().
 
 
@@ -1473,7 +1495,7 @@ void ClearLeftRight(float rotation = 0.0)
     LOG_U(LOG_INFO, ")\n");
 
     // Clear from left and right
-    for (int16_t i = -(int16_t)MAX_SCALE_I; 
+    for (int16_t i = -(int16_t)MAX_SCALE_I;
          (i <= (int16_t)MAX_SCALE_I) && !AbortShape; i += WIPE_RASTER_INC)
     {
         ReadPots();
@@ -1553,6 +1575,10 @@ void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, ui
     outerR = constrain(outerR, MIN_CLOVER_VAL, MAX_CLOVER_VAL);
     res    = constrain(res,    MIN_CLOVER_RES, MAX_CLOVER_RES);
 
+    // Show our call.  This may come in handy.  If an interesting path is displayed,
+    // the arguments may be used again.
+    LOG_F(LOG_INFO, "Clover(%d,%d,%d,%d,%d)\n", fixedR, outerR, xSize, ySize, res);
+
     // Reduce the radii values.
     Reduce(fixedR, outerR);
 
@@ -1621,10 +1647,6 @@ void RandomClover()
     uint16_t ySize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
     uint16_t res   = random(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
 
-    // Show our call.  This may come in handy.  If an interesting path is displayed,
-    // the arguments may be used again.
-    LOG_F(LOG_INFO, "Clover(%d,%d,%d,%d,%d)\n", a, b, xSize, ySize, res);
-
     // Make the call to Rose().
     Clover(a, b, xSize, ySize, res);
 } // End RandomClover().
@@ -1648,6 +1670,10 @@ void Heart(uint16_t size, float rotation, uint16_t res)
     res = constrain(res, MIN_HEART_RES, MAX_HEART_RES);
     float baseAngle = PI_X_2 / (float)res;
 
+    LOG_F(LOG_INFO, "Heart(%d,", size);
+    LOG_U(LOG_INFO, RtoD(rotation));
+    LOG_F(LOG_INFO, ",%d)\n", res);
+
     // Loop to create the heart.
     for (uint16_t i = 0; (i <= res) && !AbortShape; i++)
     {
@@ -1670,7 +1696,7 @@ void Heart(uint16_t size, float rotation, uint16_t res)
 /////////////////////////////////////////////////////////////////////////////////
 void HeartSeries()
 {
-    LOG_U(LOG_INFO, "HeartSeries()\n");
+    LOG_U(LOG_INFO, "HeartSeries");
 
     // Generate some legal arguments for the calls to Heart().
     uint16_t size = random(MIN_HEART_SIZE, (3 * MAX_SCALE_I / 4) + 1);
@@ -1686,15 +1712,12 @@ void HeartSeries()
     // Loop to create the Heart series.
     for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
-        LOG_F(LOG_INFO, "Heart(%d,", size);
-        LOG_U(LOG_INFO, RtoD(rot));
-        LOG_F(LOG_INFO, ",%d)\n", res);
-
         // Make the call to Heart() and increment our size and rotation.
         Heart(size, rot, res);
         size += sizeInc;
         rot += rotInc;
     }
+    EndSeries();
 } // End HeartSeries().
 
 
@@ -1730,6 +1753,11 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
     // Update our variable in/out limits.
     inLimit  = constrain(inLimit,  0, (int16_t)(8 * MAX_SCALE_I / 10));
     outLimit = constrain(outLimit, inLimit + 10, (int16_t)MAX_SCALE_I);
+
+    // Show our call.
+    LOG_F(LOG_INFO, "MotorRatios(");
+    LOG_U(LOG_INFO, ratio);
+    LOG_F(LOG_INFO, ",%d,%d,%d)\n", multiplePoints, inLimit, outLimit);
 
     // Convert our in out units to in/out motor steps.
     InLimit  = ((int32_t)inLimit  * (int32_t)INOUT_TOTAL_STEPS) / (int32_t)MAX_SCALE_I;
@@ -1884,8 +1912,8 @@ void RandomRatiosRing()
 /////////////////////////////////////////////////////////////////////////////////
 const PlotInfo Plots[] =
 {
-    {MazePlot, sizeof(MazePlot) / sizeof(MazePlot[0]), true},
-    {JMCPlot,  sizeof(JMCPlot) / sizeof(JMCPlot[0]),   false}
+    {JMCPlot,  sizeof(JMCPlot) / sizeof(JMCPlot[0]),   false},
+    {MazePlot, sizeof(MazePlot) / sizeof(MazePlot[0]), true}
 }; // End Plots[].
 
 
@@ -1901,6 +1929,9 @@ const PlotInfo Plots[] =
 /////////////////////////////////////////////////////////////////////////////////
 void PlotShapeArray(const Coordinate shape[], uint16_t size, bool rotate)
 {
+    // Show our call.
+    LOG_F(LOG_INFO, "PlotShapeArray(%d,%d,%d)\n", (int)shape, size, rotate);
+
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.
     float rotation = (rotate ? (RadAngle - atan2f(shape[0].y, shape[0].x)) : 0.0);
@@ -1968,7 +1999,6 @@ void RandomPlot()
 {
     // Select a random one and execute it.
     uint16_t index = random(0, sizeof(Plots) / sizeof(Plots[0]));
-    LOG_F(LOG_INFO, "PlotShapeArray(%d)\n", index);
     PlotShapeArray(Plots[index].m_Plot, Plots[index].m_Size, Plots[index].m_Rotate);
 } // End RandomPlot().
 
@@ -1989,6 +2019,10 @@ void Polygon(uint16_t numSides, uint16_t size, float rotation)
     numSides = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
     float scale = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
+    LOG_F(LOG_INFO, "Polygon(%d,%d,", numSides, size);
+    LOG_U(LOG_INFO, RtoD(rotation));
+    LOG_U(LOG_INFO, ")\n");
+
     // Loop to create the (possibly rotated) polygon.
     for (uint16_t i = 0; (i <= numSides) && !AbortShape; i++)
     {
@@ -2005,7 +2039,7 @@ void Polygon(uint16_t numSides, uint16_t size, float rotation)
 /////////////////////////////////////////////////////////////////////////////////
 void PolygonSeries()
 {
-    LOG_U(LOG_INFO, "PolygonSeries()\n");
+    LOG_U(LOG_INFO, "PolygonSeries");
 
     // Generate some legal arguments for the calls to Polygon().
     uint16_t sides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
@@ -2021,16 +2055,36 @@ void PolygonSeries()
     // Loop to create the polygon series.
     for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
-        LOG_F(LOG_INFO, "Polygon(%d,%d,", sides, size);
-        LOG_U(LOG_INFO, RtoD(rot));
-        LOG_U(LOG_INFO, ")\n");
-
         // Make the call to Polygon() and increment our size and rotation.
         Polygon(sides, size, rot);
         size += sizeInc;
         rot += rotInc;
     }
+    EndSeries();
 } // End PolygonSeries().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// RandomLines()
+//
+// Create a random number of random lines.
+/////////////////////////////////////////////////////////////////////////////////
+void RandomLines()
+{
+    LOG_U(LOG_INFO, "RandomLines()\n");
+
+    // Determine how many lines to generate.
+    uint16_t numPoints = random(MIN_RANDOM_POINTS, MAX_RANDOM_POINTS);
+
+    // Generate the random lines.
+    for (uint16_t i = numPoints; i; i--)
+    {
+        LOG_F(LOG_INFO, "%d\n", i);
+
+        GotoXY(random(-(int16_t)MAX_SCALE_I, (int16_t)MAX_SCALE_I + 1),
+               random(-(int16_t)MAX_SCALE_I, (int16_t)MAX_SCALE_I + 1));
+    }
+} // End RandomLines().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2054,6 +2108,9 @@ void Rose(uint16_t num, uint16_t denom, uint16_t xSize, uint16_t ySize, uint16_t
     xSize = constrain(xSize, MIN_ROSE_SIZE, MAX_SCALE_I);
     ySize = constrain(ySize, MIN_ROSE_SIZE, MAX_SCALE_I);
     res   = constrain(res,   MIN_ROSE_RES, MAX_ROSE_RES);
+
+    // Show our call.
+    LOG_F(LOG_INFO, "Rose(%d,%d,%d,%d,%d)\n", num, denom, xSize, ySize, res);
 
     Reduce(num, denom);
 
@@ -2102,8 +2159,6 @@ void RandomRose()
     uint16_t xSize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
     uint16_t ySize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
     uint16_t res   = random(MIN_ROSE_RES,MAX_ROSE_RES + 1 );
-    // Show our call.
-    LOG_F(LOG_INFO, "Rose(%d,%d,%d,%d,%d)\n", n, d, xSize, ySize, res);
 
     // Make the call to Rose().
     Rose(n, d, xSize, ySize, res);
@@ -2128,6 +2183,9 @@ void Spirograph (uint16_t fixedR, uint16_t r, uint16_t a)
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, MAX_SCALE_I);
     r = constrain(r, MIN_SPIRO_SMALLR, fixedR - 5);
     a = constrain(a, MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+
+    // Show our call.
+    LOG_F(LOG_INFO, "Spirograph(%d,%d,%d)\n", fixedR, r, a);
 
     float          rDiff      = (float)(fixedR - r);
                                            // Difference between fixed radius and r.
@@ -2179,9 +2237,6 @@ void RandomSpirograph()
     uint16_t r = random(MIN_SPIRO_SMALLR, fixedR - 5);
     uint16_t a = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
 
-    // Show our call.
-    LOG_F(LOG_INFO, "Spirograph(%d,%d,%d)\n", fixedR, r, a);
-
     // Make the call to Spirograph().
     Spirograph(fixedR, r, a);
 } // End RandomSpirograph().
@@ -2208,6 +2263,9 @@ void Spirograph2(uint16_t fixedR, uint16_t r1, uint16_t r2, uint16_t d)
     r1 = constrain(r1, MIN_SPIRO_SMALLR, fixedR - 3);
     r2 = constrain(r2, MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 8));
     d  = constrain(d,  1, MAX_SCALE_I);
+
+    // Show our call.
+    LOG_F(LOG_INFO, "Spirograph2(%d,%d,%d,%d)\n", fixedR, r1, r2, d);
 
     float          rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
     float          r12Diff    = r1 - r2;      // Difference between 2 radii of rolling circles.
@@ -2272,9 +2330,6 @@ void RandomSpirograph2()
     uint16_t r2 = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
     uint16_t d  = random(1, MAX_SCALE_I + 1);
 
-    // Show our call.
-    LOG_F(LOG_INFO, "Spirograph2(%d,%d,%d,%d)\n", fixedR, r1, r2, d);
-
     // Make the call to Spirograph2().
     Spirograph2(fixedR, r1, r2, d);
 } // End RandomSpirograph2().
@@ -2298,6 +2353,9 @@ void SpirographWithSquare(uint16_t fixedR, uint16_t s, uint16_t d)
     fixedR = constrain(fixedR, MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10));
     s = constrain(s, 1, fixedR / 2);
     d = constrain(d, 1, MAX_SCALE_I);
+
+    // Show our call.
+    LOG_F(LOG_INFO, "SpirographWithSquare(%d,%d,%d)\n", fixedR, s, d);
 
     // Calculate the radius of the path traced by the center of the square.
     // Center of the square will move along a circle of radius (FIXED_R - s / 2).
@@ -2369,9 +2427,6 @@ void RandomSpirographWithSquare()
     uint16_t s = random(1, fixedR / 2 + 1);
     uint16_t d = random(1, MAX_SCALE_I + 1);
 
-    // Show our call.
-    LOG_F(LOG_INFO, "SpirographWithSquare(%d,%d,%d)\n", fixedR, s, d);
-
     // Make the call to SpirographWithSquare().
     SpirographWithSquare(fixedR, s, d);
 } // End RandomSpirographWithSquare().
@@ -2395,6 +2450,12 @@ void Star(uint16_t numPoints, float ratio, uint16_t size, float rotation)
     ratio = constrain(ratio, MIN_STAR_RATIO, MAX_STAR_RATIO);
     size = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
+    LOG_F(LOG_INFO, "Star(%d,", numPoints);
+    LOG_U(LOG_INFO, ratio);
+    LOG_F(LOG_INFO, ",%d,", size);
+    LOG_U(LOG_INFO, RtoD(rotation));
+    LOG_U(LOG_INFO, ")\n");
+
     // Loop to create the (possibly rotated) star.
     for (uint16_t i = 0; (i <= numPoints * 2) && !AbortShape; i++)
     {
@@ -2412,7 +2473,7 @@ void Star(uint16_t numPoints, float ratio, uint16_t size, float rotation)
 /////////////////////////////////////////////////////////////////////////////////
 void StarSeries()
 {
-    LOG_U(LOG_INFO, "StarSeries()\n");
+    LOG_U(LOG_INFO, "StarSeries");
 
     // Generate some legal arguments for the calls to Star().
     uint16_t points = random(MIN_STAR_POINTS + 2, MAX_STAR_POINTS / 4);
@@ -2429,17 +2490,12 @@ void StarSeries()
     // Loop to create the Star series.
     for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
     {
-        LOG_F(LOG_INFO, "Star(%d,", points);
-        LOG_U(LOG_INFO, ratio);
-        LOG_F(LOG_INFO, ",%d,", size);
-        LOG_U(LOG_INFO, RtoD(rot));
-        LOG_U(LOG_INFO, ")\n");
-
         // Make the call to Star() and increment our size and rotation.
         Star(points, ratio, size, rot);
         size += sizeInc;
         rot += rotInc;
     }
+    EndSeries();
 } // End StarSeries().
 
 
@@ -2462,6 +2518,13 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
     numNodes = constrain(numNodes, MIN_POLY_SIDES, 2 * MAX_POLY_SIDES);
     float scale = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
     float angle = rotation;
+
+    // Show our call.
+    LOG_F(LOG_INFO, "SuperStar(%d,%d,", numNodes, size);
+    LOG_U(LOG_INFO, outline);
+    LOG_U(LOG_INFO, ",");
+    LOG_U(LOG_INFO, RtoD(rotation));
+    LOG_U(LOG_INFO, ")\n");
 
     // If we are drawing a perimeter, then initial skip is 1.  Otherwise it is 2.
     uint16_t initialSkip = (outline || (numNodes < 4)) ? 1 : 2;
@@ -2525,13 +2588,6 @@ void RandomSuperStar()
     bool     outline   = RandomBool();
     float    rot       = RadAngle;
 
-    // Show our call.
-    LOG_F(LOG_INFO, "SuperStar(%d,%d,", numPoints, size);
-    LOG_U(LOG_INFO, outline);
-    LOG_U(LOG_INFO, ",");
-    LOG_U(LOG_INFO, RtoD(rot));
-    LOG_U(LOG_INFO, ")\n");
-
     // Make the call to SuperStar().
     SuperStar(numPoints, size, outline, rot);
 } // End RandomSuperStar().
@@ -2559,7 +2615,8 @@ ShapeInfo RandomShapes[] =
     ShapeInfo(HeartSeries, 15),
     ShapeInfo(EllipseSeries, 10),
     ShapeInfo(RandomRatiosRing, 10),
-    ShapeInfo(RandomWipe, 30)
+    ShapeInfo(RandomWipe, 30),
+    ShapeInfo(RandomLines, 50)
 }; // End RandomShapes[].
 
 
@@ -2593,7 +2650,7 @@ void GenerateRandomShape()
 
     // Increment the iteration count since we just executed something.
     ShapeIteration++;
-    EndPlot();
+    EndShape();
 } // End GenerateRandomShape();
 
 void ResetShapes()
@@ -2681,7 +2738,7 @@ void setup()
     // interesting sequence.
     LOG_U(LOG_ALWAYS, "Seed = ");
     LOG_U(LOG_ALWAYS, RandomSeed);
-    
+
     // Initialize runtime variables to safe values.
     SpeedDelay        = SPEED_DELAY_MAX_VAL;
     RemoteSpeedDelay  = false;
@@ -2692,7 +2749,7 @@ void setup()
     ShapeIteration    = 0;
     RandomSeedChanged = false;
     ResetShapes();
-    
+
     // Announce that we are ready to go.
     LOG_U(LOG_ALWAYS, "\nREADY\n");
 } // End setup().
@@ -2714,6 +2771,8 @@ void loop()
 
         // Change this as desired.  It is the power-up greeting.
         RotateToAngle(atan2f((float)JMCPlot[0].y, (float)JMCPlot[0].x));
+
+        // Show JMC...
         PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false);
 
         // Delay a while to let the user view your awesome work!
@@ -2724,10 +2783,10 @@ void loop()
     // Generate a random shape.
     GenerateRandomShape();
     ReadPots();
-    
+
     // If we were aborting the previous shape, we're done now.
     AbortShape = false;
-    
+
     // Start over with clean board if the random seed has changed.
     if (RandomSeedChanged)
     {
@@ -2736,7 +2795,7 @@ void loop()
         ResetShapes();
         RandomSeedChanged = false;
     }
-    
+
     delay(100);
 } // End loop().
 
