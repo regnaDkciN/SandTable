@@ -19,6 +19,8 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 24-MAR-2025 JMC
+//   - Minor cleanup.
 // - 23-MAR-2025 JMC
 //   - Reworked shape call logging.
 //   - Renamed EndPlot() to EndShape().
@@ -301,8 +303,8 @@ public:
     ShapeInfo(void (*pShape)(), uint16_t delay)
     {
         // Initialize our data based on our arguments.
-        m_pShape = pShape;
-        m_Delay  = delay;
+        m_pShape    = pShape;
+        m_Delay     = delay;
         m_LastCycle = 0;
     } // End constructor.
 
@@ -336,6 +338,7 @@ public:
         return retval;
     } // End MakeShape().
 
+
     /////////////////////////////////////////////////////////////////////////////
     // Reset()
     //
@@ -347,6 +350,7 @@ public:
     {
         m_LastCycle = 0;
     } // End Reset().
+    
 
 private:
     // Private methods so the user can't call them.
@@ -464,9 +468,11 @@ void HandleRemoteCommands()
     // If so, then undo any remote controls that may be in effect.
     if (millis() - lastMessageMs > REMOTE_TIMEOUT_MS)
     {
-        RemoteSpeedDelay = false;
-        RemoteBrightness = false;
-        RemotePause      = false;
+        RemoteSpeedDelay  = false;
+        RemoteBrightness  = false;
+        RemotePause       = false;
+        RandomSeedChanged = false;
+        AbortShape        = false;
     }
 
     // See if we got any messages.
@@ -496,7 +502,6 @@ void HandleRemoteCommands()
             break;
             // Restore local control of speed;
             case 'Q':
-                SpeedDelay = 0;
                 RemoteSpeedDelay = false;
             break;
             // Increase brightness.
@@ -523,12 +528,16 @@ void HandleRemoteCommands()
             break;
             // Start with a new random seed.
             case 'R':
+                // Read the new seed value.
                 len = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
                 buf[len] = '\0';
                 RandomSeed = atol(buf);
+                // Reset the random  number generator with the new seed value.
                 randomSeed(RandomSeed);
+                // Display our new seed to confirm that we are using the new value.
                 LOG_U(LOG_DEBUG, RandomSeed);
                 LOG_U(LOG_DEBUG, "\n");
+                // Let everyone know we changed the random seed.
                 RandomSeedChanged = true;
                 // Abort the current shape since we want the new random value to
                 // take effect at the beginning of a shape.
@@ -545,6 +554,7 @@ void HandleRemoteCommands()
             default:
             break;
         }
+        // Make sure that our speed and brightness values remain valid.
         SpeedDelay = constrain(SpeedDelay, SPEED_DELAY_MIN_VAL, SPEED_DELAY_MAX_VAL);
         Brightness = constrain(Brightness, BRIGHTNESS_MAX_VAL, BRIGHTNESS_MIN_VAL);
     }
@@ -689,7 +699,7 @@ void Reduce(uint16_t &a, uint16_t &b)
 /////////////////////////////////////////////////////////////////////////////////
 void CalculateXY()
 {
-    float r = ((float)InOutSteps  * MAX_SCALE_F) / (float)INOUT_TOTAL_STEPS;
+    float r = ((float)InOutSteps * MAX_SCALE_F) / (float)INOUT_TOTAL_STEPS;
     CurrentX = r * cosf(RadAngle);
     CurrentY = r * sinf(RadAngle);
 } // End CalculateXY().
@@ -2727,6 +2737,11 @@ void setup()
     OCR1B = 1000;         // Timer Compare1B Register.
 
     TIMSK1 |= B00000110;  // Only use one interupt.
+    
+    // Raise the LED PWM frequency to eliminate blinking at dim levels.
+    // In this case set the divisor to 2, giving PWM frequency of 31372.55 Hz.
+    TCCR2B = 1;
+    
     // We're done mucking with the timer registers, so re-enable interrupts.
     interrupts();
 
@@ -2790,9 +2805,9 @@ void loop()
     // Start over with clean board if the random seed has changed.
     if (RandomSeedChanged)
     {
+        ResetShapes();
         Home();
         ClearFromIn();
-        ResetShapes();
         RandomSeedChanged = false;
     }
 
