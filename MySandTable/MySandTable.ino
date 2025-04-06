@@ -19,6 +19,9 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 05-APR-2025 JMC
+//   - Increased LED PWM frequency to eliminate stutter at low brightness.
+//   - Added GET remote command to get the last random seed.
 // - 24-MAR-2025 JMC
 //   - Minor cleanup.
 // - 23-MAR-2025 JMC
@@ -350,7 +353,7 @@ public:
     {
         m_LastCycle = 0;
     } // End Reset().
-    
+
 
 private:
     // Private methods so the user can't call them.
@@ -454,6 +457,7 @@ const Coordinate JMCPlot[] =
 //  'R 'newSeed'
 //      (RANDOM SEED) Re-seeds the random number generator with the value of
 //                    'newSeed', homes the axes and clears the board.
+//  'G' (GET)         Get the last random seed.
 //  'N' (NEXT)        Aborts the current shape and starts the next one.
 //  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the
 //                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
@@ -534,14 +538,17 @@ void HandleRemoteCommands()
                 RandomSeed = atol(buf);
                 // Reset the random  number generator with the new seed value.
                 randomSeed(RandomSeed);
-                // Display our new seed to confirm that we are using the new value.
-                LOG_U(LOG_DEBUG, RandomSeed);
-                LOG_U(LOG_DEBUG, "\n");
                 // Let everyone know we changed the random seed.
                 RandomSeedChanged = true;
                 // Abort the current shape since we want the new random value to
                 // take effect at the beginning of a shape.
                 AbortShape = true;
+                [[fallthrough]];
+            // Get the last random seed.
+            // Note that the 'R' case falls through to this case.
+            case 'G':
+                LOG_U(LOG_ALWAYS, RandomSeed);
+                LOG_U(LOG_ALWAYS, "\n");
                 break;
             // Next shape - Abort the current shape and start the next.
             case 'N':
@@ -2737,11 +2744,11 @@ void setup()
     OCR1B = 1000;         // Timer Compare1B Register.
 
     TIMSK1 |= B00000110;  // Only use one interupt.
-    
+
     // Raise the LED PWM frequency to eliminate blinking at dim levels.
     // In this case set the divisor to 2, giving PWM frequency of 31372.55 Hz.
     TCCR2B = 1;
-    
+
     // We're done mucking with the timer registers, so re-enable interrupts.
     interrupts();
 
