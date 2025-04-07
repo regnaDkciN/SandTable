@@ -19,6 +19,8 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 07-APR-2025 JMC
+//   - Added a function to generate a random seed - GenerateRandomSeed().
 // - 05-APR-2025 JMC
 //   - Increased LED PWM frequency to eliminate stutter at low brightness.
 //   - Added GET remote command to get the last random seed.
@@ -82,6 +84,7 @@ const int LIGHTS_PIN         = 11;          // Lights (LEDs)) outpuut pin.
 const int BRIGHTNESS_POT_PIN = A0;          // Brightness pot pin.
 const int SPEED_POT_PIN      = A1;          // Speed pot pin.
 const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
+const int RANDOM_SEED_PIN    = A2;          // Analog pin used to gen rand seed.
 
 // Hardware related constants.
 const int16_t ROT_TOTAL_STEPS   = 16000;    // Rotation axis total steps.
@@ -567,6 +570,86 @@ void HandleRemoteCommands()
     }
 } // End HandleRemoteCommands().
 
+/////////////////////////////////////////////////////////////////////////////////
+// GenerateRandomSeed()
+//
+// Generates a 31 bit random seed using the specified (hopefully) unused analog
+// input pin.  This version is based on the work of "celafon" as posted at:
+// https://forum.arduino.cc/t/best-way-of-random-seed/640617/7
+//
+// In order to conserve memory, this version is hard coded to generate a 31-bit
+// seed, and takes the analog input pin as an argument.
+//
+// Arguments:
+//   pin - The unused analog input pin that will be used to generate the seed.
+//
+// Returns:
+//  If 'pin' specifies a valid analog input pin, a 32-bit random seed is returned.
+//  Otherwise, a random value based on micros() will be returned.
+//
+// Notes:
+//   - The analog pin is returned to its entry state before exit.
+//   - This code is highly Arduino UNO dependent.  Probably won't work for other
+//     processors.
+/////////////////////////////////////////////////////////////////////////////////
+uint32_t GenerateRandomSeed(int pin)
+{
+    const uint16_t NUM_BITS           = 31;     // Number of seed bits.
+    const uint16_t BASE_INTERVAL_MS   = 1UL;    // Minumum wait time.
+    const uint16_t SAMPLE_SIGNIFICANT = 7;      // Modulus of the input sample.
+    const uint16_t SAMPLE_MULTIPLIER  = 10;     // ms per sample digit difference.
+    const uint16_t HASH_ITERATIONS    = 3;      // # iterations to generate the seed.
+
+    uint32_t result  = 0;   // Our 32-bit result seed.
+    uint16_t tempBit = 0;   // Used to build the random seed.
+
+    // Save our current analog pin state so we can restore it later.
+    uint8_t bit  = digitalPinToBitMask(pin);
+    uint8_t port = digitalPinToPort(pin);
+    // Validate the specified pin.  If invalid, return # microseconds since startup.
+    if ((port == NOT_A_PIN) || (bit == 0) || (bit & (bit - 1)))
+    {
+        LOG_U(LOG_INFO, "Bad seed pin!\n");
+        return micros();
+    }
+
+    volatile uint8_t *modeReg = portModeRegister(port);
+    volatile uint8_t *outReg = portOutputRegister(port);
+    uint8_t modeSave = *modeReg & bit;
+    uint8_t outSave  = *outReg & bit;
+
+    // Pull the analog seed pin up, then not up in order to start a voltage decay.
+    pinMode(RANDOM_SEED_PIN, INPUT_PULLUP);
+    pinMode(RANDOM_SEED_PIN, INPUT);
+    delay(200);
+
+    // Now there will be a slow decay of the voltage, about 8 seconds,
+    // so pick a point on the curve offset by the processed previous sample:
+    for (uint16_t bits = 0; bits < NUM_BITS; bits++)
+    {
+        uint16_t intervalMs = 0;
+
+        for (uint16_t i = 0; i < HASH_ITERATIONS; i++)
+        {
+            delay(BASE_INTERVAL_MS + intervalMs);
+
+            // Take a sample.
+            uint16_t reading = analogRead(pin);
+            tempBit ^= reading & 1;
+
+            // Take the low "digits" of the reading and multiply it to scale
+            // it to map a new point on the decay curve:
+            intervalMs = (reading % SAMPLE_SIGNIFICANT) * SAMPLE_MULTIPLIER;
+        }
+        result |= (uint32_t)(tempBit & 1) << bits;
+    }
+
+    // Restore the analog register to its initial state.
+    *modeReg = (*modeReg & ~bit) | modeSave;
+    *outReg  = (*outReg  & ~bit) | outSave;
+
+    return result;
+} // End GenerateRandomSeed().
 
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
@@ -2753,7 +2836,7 @@ void setup()
     interrupts();
 
     // Seed the random number generator.
-    RandomSeed = micros();
+    RandomSeed = GenerateRandomSeed(RANDOM_SEED_PIN);
     randomSeed(RandomSeed);
 
     // Display the random number.  It may be used in the future to repeat an
