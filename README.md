@@ -417,7 +417,8 @@ ShapeInfo RandomShapes[] =
     ShapeInfo(StarSeries, 10),
     ShapeInfo(HeartSeries, 15),
     ShapeInfo(EllipseSeries, 10),
-    ShapeInfo(RandomWipe, 30)
+    ShapeInfo(RandomWipe, 30),
+    ShapeInfo(RandomLines, 50)
 }; // End RandomShapes[].
 ```
 * `RandomShapes[]` entries consist of a pointer to the associated function, and a delay value.  The delay value specifies the number of execution cycles that must elapse between executions of the shape.  That is, some shapes should not be generated very often.  This value keeps the shape from occurring too frequently.  For example, wipes should be done rarely, so the delay value used for `RandomWipe()` is 30.  This means that at least 30 other shapes must be displayed before another wipe occurs.
@@ -463,6 +464,7 @@ Limited capability to control the sand table remotely via the serial port was ad
 * 'R 'newSeed'
     (RANDOM SEED) Re-seeds the random number generator with the value of
                   'newSeed', homes the axes and clears the board.
+* 'G' (GET)         Get the last random seed.
 * 'N' (NEXT)        Aborts the current shape and starts the next one.
 * 'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the 
                   serial port after REMOTE_TIMEOUT_MS milliseconds, then all
