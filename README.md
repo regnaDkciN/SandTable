@@ -424,10 +424,10 @@ ShapeInfo RandomShapes[] =
 * `RandomShapes[]` entries consist of a pointer to the associated function, and a delay value.  The delay value specifies the number of execution cycles that must elapse between executions of the shape.  That is, some shapes should not be generated very often.  This value keeps the shape from occurring too frequently.  For example, wipes should be done rarely, so the delay value used for `RandomWipe()` is 30.  This means that at least 30 other shapes must be displayed before another wipe occurs.
 
 ## Random Seed 
-At the end of `setup()`, a seed for the random number generator is fed to `randomSeed()`.  This seed value is based on the number of microseconds since power-up.  This helps to insure that each power-up will generate unique patterns.  The random seed value is logged to the serial port so that it may be saved if needed.  A serial port interface has been added which  allows re-seeding the random number generator to any value.  This provides the ability to manually set the random number generator to a previously reported value in order to duplicate a particular run pattern.
+At the end of `setup()`, a seed for the random number generator is fed to `randomSeed()`.  A new function was added - `GenerateRandomSeed()` - that generates better random seed values using an unused analog input pin (A2).  This helps to insure that each power-up will generate unique patterns.  The random seed value is logged to the serial port so that it may be saved if needed.  A serial port interface has been added which  allows re-seeding the random number generator to any value.  This provides the ability to manually set the random number generator to a previously reported value in order to duplicate a particular run pattern.
 ```
     // Seed the random number generator.
-    RandomSeed = micros();
+    RandomSeed = GenerateRandomSeed();
     randomSeed(RandomSeed);
 ```
 
