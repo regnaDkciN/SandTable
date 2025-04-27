@@ -1,5 +1,5 @@
 /////////////////////////////////////////////////////////////////////////////////
-// MySandTable.ino
+// MySandTable2350.ino
 //
 // This file consists of an Arduino sketch that is used to control the sand table
 // titled "World's First Cycloid Art Table: How I Built This Arduino-Powered
@@ -19,29 +19,46 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
-// - 09-APR-2025
-// - Minor fix to GenerateRandomSeed().
-// - 07-APR-2025 JMC
-//   - Added a function to generate a random seed - GenerateRandomSeed().
-// - 05-APR-2025 JMC
-//   - Increased LED PWM frequency to eliminate stutter at low brightness.
-//   - Added GET remote command to get the last random seed.
-// - 24-MAR-2025 JMC
-//   - Minor cleanup.
-// - 23-MAR-2025 JMC
-//   - Reworked shape call logging.
-//   - Renamed EndPlot() to EndShape().
-//   - Added EndSeries() to announce the end of a series.
-//   - Added RandomLines().
-// - 21-MAR-2025 JMC
-//   - Added remote command handling in prep for possible external controller.
-// - 01-MAR-2025 JMC Original creation.
+// - 27-APR-2025
+//   - Original from MySandTable.ino (Arduino UNO version).  Ported to work
+//     with Adafruit Metro 2350 board.  Changes include:
+//       + Using fast data types since 2350 is not tight on memory.
+//       + Use 1 uSec alarm timer for ISRs (UNO used 4uSec timer).
+//       + Converted ISRs for 2350.
+//       + Use 2340 get_rand32() to generate starting random seed.
+//       + Changed squaref() to sq() due to API differences.
+//       + Changed rotary axis enable GPIO to D22 since the Metro uses D12 for
+//         other functions.
+//       + Changed serial logging to use single printf like macro.
+//       + Reworked analog pot reading to throw away 4 LSB's due 2350's noise
+//         A2D issue.
+//       + Update LEDs while homing.
+//       + Temporarily changed all floats and float operations to doubles to
+//         work around a 2350 FPU compiler issue #2429:
+//         https://github.com/raspberrypi/pico-sdk/pull/2429
+//         The issue has been fixed on the development branch, but not added
+//         to the release branch yet.  When it is released, this sand table
+//         code will restore operation with floats, as double precision is not
+//         needed.
 //
 // Copyright (c) 2025, Joseph M. Corbett
 /////////////////////////////////////////////////////////////////////////////////
+#if 0 //%%%jmc
+#include <Adafruit_NeoPixel.h> //%%%jmc
+#include <SPI.h> //%%%jmc
+#include "SdFat.h" //%%%jmc
+#endif //%%%jmc
 #include <limits.h>     // For UINT_MAX.
-#include "SerialLog.h"  // For data logging macros (LOG_F and LOG_U).
+#include "SerialLog2350.h"  // For data logging macro (LOG_F).
 
+#if 0 //%%%jmc
+#define SD_CS_PIN 39
+SdFat SD;
+FsFile myFile;
+SdSpiConfig config(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(16), &SPI1);
+#define NUMPIXELS 1
+Adafruit_NeoPixel pixel(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+#endif //%%%jmc
 
 /////////////////////////////////////////////////////////////////////////////////
 // S E R I A L   L O G   S E T T I N G S
@@ -57,14 +74,6 @@
 #define LOG_STEP         false      // Log data to help stepping ShapeArrays
 #define LOG_CYCLES       true       // Log useful info regarding remaining cycles.
 #define LOG_ALWAYS       true       // Log data unconditionally.
-#define LOG_BUF_SIZE     60         // Important: size of formatted log buffer.
-                                    // All formatted log strings are limited to
-                                    // this size.
-char LogBuf[LOG_BUF_SIZE];          // Buffer for formatting log data.
-
-// Logging macros to ease log use.
-#define LOG_F(level, ...)   LOGF(LogBuf, LOG_BUF_SIZE, level, __VA_ARGS__)
-#define LOG_U(level, v)     LOGU(level, v)
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -79,123 +88,126 @@ char LogBuf[LOG_BUF_SIZE];          // Buffer for formatting log data.
 const int EN_INOUT_PIN       = 8;           // Y azis (in/out) enable pin.
 const int STEP_INOUT_PIN     = 3;           // Y axis (in/out) step pin.
 const int DIR_INOUT_PIN      = 6;           // Y axis (in/out) direction pin.
-const int EN_ROT_PIN         = 12;          // Z axis (rotation) enable pin.
+const int EN_ROT_PIN         = 22;          // Z axis (rotation) enable pin.
 const int STEP_ROT_PIN       = 4;           // Z axis (rotation) step pin.
 const int DIR_ROT_PIN        = 7;           // Z axis (rotation) direction pin.
-const int LIGHTS_PIN         = 11;          // Lights (LEDs)) outpuut pin.
+const int LIGHTS_PIN         = 11;          // Lights (LEDs) outpuut pin.
 const int BRIGHTNESS_POT_PIN = A0;          // Brightness pot pin.
 const int SPEED_POT_PIN      = A1;          // Speed pot pin.
 const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
-const int RANDOM_SEED_PIN    = A2;          // Analog pin used to gen rand seed.
 
 // Hardware related constants.
-const int16_t ROT_TOTAL_STEPS   = 16000;    // Rotation axis total steps.
-const int16_t INOUT_TOTAL_STEPS = 4300;     // In/Out axis total steps.
-const int16_t GEAR_RATIO        = 10;       // Ratio of rotary (big) gear to inout
-                                            // (small) gear.
-const float   MAX_SCALE_F       = 100.0;    // Maximum X or Y coordinate value.
-const uint32_t MAX_SCALE_I      = (uint32_t)MAX_SCALE_F;
-                                            // Maximum X or Y coordinate value.
-const float   STEPS_PER_UNIT    = 1.0;      // Higher values produce smoother moves
-                                            // Good values range from 1.0 to 10.0.
-const uint16_t HOME_ROT_OFFSET  = 347 * (ROT_TOTAL_STEPS / 1000);
-                                            // The rotational offset to be applied
-                                            // after detecting the rotary home switch
-                                            // while homing.
-const uint16_t MIN_FORCE_DELAY  = 100;      // Minimum servo update delay when forcing.
-const uint16_t MAX_FORCE_DELAY  = 1000;     // Maximum servo update delay when forcing.
-const float    WIPE_RATIO       = 9.4;      // This constant should be changed based on
-                                            // ball size.  9.4 is a good value for use
-                                            // with 3mm cylindrical magnet.
-const uint16_t WIPE_RASTER_INC  = 4;        // This constant should be changed based on
-                                            // ball size.  4 is a good value for use
-                                            // with 3mm cylindrical magnet.
-const uint32_t REMOTE_TIMEOUT_MS = 10000;   // Remote command timeout (milliseconds).
+const int_fast16_t  ROT_TOTAL_STEPS   = 16000;  // Rotation axis total steps.
+const int_fast16_t  INOUT_TOTAL_STEPS = 4300;   // In/Out axis total steps.
+const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to inout
+                                                // (small) gear.
+const double       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
+const uint_fast32_t MAX_SCALE_I       = (uint_fast32_t)MAX_SCALE_F;
+                                                // Maximum X or Y coordinate value.
+const double       STEPS_PER_UNIT    = 1.0;    // Higher values produce smoother moves
+                                                // Good values range from 1.0 to 10.0.
+const uint_fast16_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
+                                                // The rotational offset to be applied
+                                                // after detecting the rotary home switch
+                                                // while homing.
+const uint_fast16_t MIN_FORCE_DELAY   = 100;    // Minimum servo update delay when forcing.
+const uint_fast16_t MAX_FORCE_DELAY   = 1000;   // Maximum servo update delay when forcing.
+const double       WIPE_RATIO        = 9.4;    // This constant should be changed based on
+                                                // ball size.  9.4 is a good value for use
+                                                // with 3mm cylindrical magnet.
+const uint_fast16_t WIPE_RASTER_INC   = 4;      // This constant should be changed based on
+                                                // ball size.  4 is a good value for use
+                                                // with 3mm cylindrical magnet.
+const uint_fast32_t REMOTE_TIMEOUT_MS = 10000;  // Remote command timeout (milliseconds).
 
 // Useful constants.
-const uint8_t IN              = 1;          // In/Out axis IN direction.
-const uint8_t OUT             = 0;          // In/Out axis OUT direction.
-const uint8_t CW              = 0;          // Rotation axis CLOCKWISE direction.
-const uint8_t CCW             = 1;          // Rotation axis COUNTERCLOCKWISE direction.
-const float   PI_X_2          = PI * 2.0;   // Useful in many trig calculations.
-const float   FLOAT_PRECISION = 100.0;      // Use 2 significant digits for random floats.
+const uint_fast8_t IN              = 1;          // In/Out axis IN direction.
+const uint_fast8_t OUT             = 0;          // In/Out axis OUT direction.
+const uint_fast8_t CW              = 0;          // Rotation axis CLOCKWISE direction.
+const uint_fast8_t CCW             = 1;          // Rotation axis COUNTERCLOCKWISE direction.
+const double      PI_X_2          = PI * 2.0;   // Useful in many trig calculations.
+const double      FLOAT_PRECISION = 100.0;      // Use 2 significant digits for random floats.
 
 // Potentiometer related constants.
-const uint16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
-const uint16_t KNOB_MAX_VAL        = 1023;  // Maximum analog reading for knob.
-const int16_t  SPEED_DELAY_MIN_VAL = 25;    // Minimum axis moving delay value.
-                                            // This macro limits the maximum speed.
-                                            // Original code used 50.  25 is obviously
-                                            // twice as fast, but it is also twice
-                                            // as noisy.  The speed knob can always
-                                            // be turned down to reduce noise if
-                                            // desired, or this value could be
-                                            // increased to 50 or 60.
-const int16_t  SPEED_DELAY_MAX_VAL = 500;   // Maximum axis speed delay value.
-const int16_t  BRIGHTNESS_MIN_VAL  = 0;     // Minimum LED brightness value.
-const int16_t  BRIGHTNESS_MAX_VAL  = 255;   // Maximum LED brightness value.
+const int_fast32_t  PWM_FREQ            = 100000; // PWM frequency.
+const int_fast16_t  ANALOG_RESOLUTION   = 12;    // Number of ADC bits.
+const int_fast16_t  ANALOG_SHIFT_FACTOR = 4;     // Amount to shift analog pot readings
+                                                 // to mitigate ADC jitter.
+const uint_fast16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
+const uint_fast16_t KNOB_MAX_VAL        = (1 << (ANALOG_RESOLUTION - ANALOG_SHIFT_FACTOR)) - 1;
+                                                // Maximum analog reading for knob.
+const int_fast16_t  SPEED_DELAY_MIN_VAL = 100;   // Minimum axis moving delay value (uSec).
+                                                 // This macro limits the maximum speed.
+                                                 // Original code used 200.  100 is obviously
+                                                 // twice as fast, but it is also twice
+                                                 // as noisy.  The speed knob can always
+                                                 // be turned down to reduce noise if
+                                                 // desired, or this value could be
+                                                 // increased to 200 or 240.
+const int_fast16_t  SPEED_DELAY_MAX_VAL = 2000;  // Maximum axis speed delay value (uSec).
+const int_fast16_t  BRIGHTNESS_MIN_VAL  = 0;     // Minimum LED brightness value .
+const int_fast16_t  BRIGHTNESS_MAX_VAL  = 255;   // Maximum LED brightness value.
 
 // Shape algorithm limits.
-const uint16_t MAX_CYCLES      = 50;        // Maximum cycles to generate when drawing.
-const uint16_t MAX_STAR_POINTS = 40;        // Max number of Star() points.
-const uint16_t MIN_STAR_POINTS = 3;         // Min number of Star() points.
-const float    MAX_STAR_RATIO  = 0.95;      // Max ratio of Star() inside to outside points.
-const float    MIN_STAR_RATIO  = 0.1;       // Min ratio of Star() inside to outside points.
+const uint_fast16_t MAX_CYCLES      = 50;        // Maximum cycles to generate when drawing.
+const uint_fast16_t MAX_STAR_POINTS = 40;        // Max number of Star() points.
+const uint_fast16_t MIN_STAR_POINTS = 3;         // Min number of Star() points.
+const double       MAX_STAR_RATIO  = 0.95;      // Max ratio of Star() inside to outside points.
+const double       MIN_STAR_RATIO  = 0.1;       // Min ratio of Star() inside to outside points.
 
-const uint16_t MAX_POLY_SIDES  = 8;         // Max number of polygon sides.
-const uint16_t MIN_POLY_SIDES  = 3;         // Min number of polygon sides.
-const uint16_t MIN_POLY_SIZE   = MAX_SCALE_I / 4;
-                                            // Min size of a polygon or star.
+const uint_fast16_t MAX_POLY_SIDES  = 8;         // Max number of polygon sides.
+const uint_fast16_t MIN_POLY_SIDES  = 3;         // Min number of polygon sides.
+const uint_fast16_t MIN_POLY_SIZE   = MAX_SCALE_I / 4;
+                                                 // Min size of a polygon or star.
 
-const float    MAX_MOTOR_RATIO = WIPE_RATIO;// Max motor ratio value.
-const float    MIN_MOTOR_RATIO = 1.0 / MAX_MOTOR_RATIO;
-                                            // Min motor ratio value.
+const double    MAX_MOTOR_RATIO = WIPE_RATIO;   // Max motor ratio value.
+const double    MIN_MOTOR_RATIO = 1.0 / MAX_MOTOR_RATIO;
+                                                 // Min motor ratio value.
 
-const uint16_t MIN_CIRCLE_SIZE = MAX_SCALE_I / 4;
-                                            // Min circle size.
-const uint16_t MAX_CIRCLE_SIZE = MAX_SCALE_I;
-                                            // Max non-lobed circle size.
-const uint16_t MIN_CIRCLE_LOBES= 1;         // Min circle lobes.
-const uint16_t MAX_CIRCLE_LOBES= 10;        // Max circle lobes.
+const uint_fast16_t MIN_CIRCLE_SIZE = MAX_SCALE_I / 4; // Min circle size.
+const uint_fast16_t MAX_CIRCLE_SIZE = MAX_SCALE_I;
+                                                 // Max non-lobed circle size.
+const uint_fast16_t MIN_CIRCLE_LOBES= 1;         // Min circle lobes.
+const uint_fast16_t MAX_CIRCLE_LOBES= 10;        // Max circle lobes.
 
-const uint16_t MIN_SPIRO_FIXEDR= MAX_SCALE_I / 3;
-                                            // Minimum spirograph fixed R size.
-const uint16_t MIN_SPIRO_SMALLR= 8;         // Minimum spirograph moving circle radius.
-const uint32_t SPIRO_NUM_POINTS= 300;       // Number of points to step for
-                                            // spirograph shapes.
-const float    SPIRO_ANGLE_BASE= PI_X_2 / (float)SPIRO_NUM_POINTS;
-                                            // Base angle for spirograph shapes.
+const uint_fast16_t MIN_SPIRO_FIXEDR= MAX_SCALE_I / 3;
+                                                 // Minimum spirograph fixed R size.
+const uint_fast16_t MIN_SPIRO_SMALLR= 8;         // Minimum spirograph moving circle radius.
+const uint_fast32_t SPIRO_NUM_POINTS= 300;       // Number of points to step for
+                                                 // spirograph shapes.
+const double    SPIRO_ANGLE_BASE= PI_X_2 / (double)SPIRO_NUM_POINTS;
+                                                 // Base angle for spirograph shapes.
 
-const uint16_t MIN_ROSE_VAL    = 1;         // Minimum rose shape num and denom values.
-const uint16_t MAX_ROSE_VAL    = 20;        // Maximum rose shape num and denom values.
-const uint16_t MIN_ROSE_SIZE   = MAX_SCALE_I / 4;
-                                            // Minimum rose x/y size.
-const uint16_t MIN_ROSE_RES    = 2;         // Minimum smoothness resolution.
-const uint16_t MAX_ROSE_RES    = 64;        // Maximum smoothness resolution.
+const uint_fast16_t MIN_ROSE_VAL    = 1;         // Minimum rose shape num and denom values.
+const uint_fast16_t MAX_ROSE_VAL    = 20;        // Maximum rose shape num and denom values.
+const uint_fast16_t MIN_ROSE_SIZE   = MAX_SCALE_I / 4;
+                                                 // Minimum rose x/y size.
+const uint_fast16_t MIN_ROSE_RES    = 2;         // Minimum smoothness resolution.
+const uint_fast16_t MAX_ROSE_RES    = 64;        // Maximum smoothness resolution.
 
-const uint16_t MIN_CLOVER_VAL  = 1;         // Minimum clover shape radius values.
-const uint16_t MAX_CLOVER_VAL  = 10;        // Maximum clover shape radius values.
-const uint16_t MIN_CLOVER_SIZE = MAX_SCALE_I / 4;
-                                            // Minimum clover x/y size.
-const uint16_t MIN_CLOVER_RES  = 6;         // Minimum clover resolution values.
-const uint16_t MAX_CLOVER_RES  = 180;       // Minimum clover resolution values.
+const uint_fast16_t MIN_CLOVER_VAL  = 1;         // Minimum clover shape radius values.
+const uint_fast16_t MAX_CLOVER_VAL  = 10;        // Maximum clover shape radius values.
+const uint_fast16_t MIN_CLOVER_SIZE = MAX_SCALE_I / 4;
+                                                 // Minimum clover x/y size.
+const uint_fast16_t MIN_CLOVER_RES  = 6;         // Minimum clover resolution values.
+const uint_fast16_t MAX_CLOVER_RES  = 180;       // Minimum clover resolution values.
 
-const uint16_t MIN_ELLIPSE_SIZE = MAX_SCALE_I / 4;
-                                            // Minimum ellipse x-axis size;
-const float    MIN_ELLIPSE_RATIO = 1.3;     // Minimum ellipse ratio.
-const float    MAX_ELLIPSE_RATIO = 8.0;     // Mzximum ellipse ratio.
+const uint_fast16_t MIN_ELLIPSE_SIZE = MAX_SCALE_I / 4;
+                                                 // Minimum ellipse x-axis size;
+const double    MIN_ELLIPSE_RATIO = 1.3;        // Minimum ellipse ratio.
+const double    MAX_ELLIPSE_RATIO = 8.0;        // Mzximum ellipse ratio.
 
-const uint16_t MIN_SERIES_STEPS = 1;        // Minimum number of series steps.
-const uint16_t MAX_SERIES_STEPS = 12;       // Maximum number of series steps.
-const uint16_t MIN_SERIES_INC   = 8;        // Maximum size increment for series.
-const float    MAX_SERIES_ANGLE = 20.0;     // Maximum angle increment for series.
+const uint_fast16_t MIN_SERIES_STEPS = 1;        // Minimum number of series steps.
+const uint_fast16_t MAX_SERIES_STEPS = 12;       // Maximum number of series steps.
+const uint_fast16_t MIN_SERIES_INC   = 8;        // Maximum size increment for series.
+const double    MAX_SERIES_ANGLE = 20.0;        // Maximum angle increment for series.
 
-const uint16_t MIN_HEART_SIZE   = MAX_SCALE_I / 4; // Minimum heart size.
-const uint16_t MIN_HEART_RES    = 8;        // Minimum heart size.
-const uint16_t MAX_HEART_RES    = 128;      // Minimum heart size.
+const uint_fast16_t MIN_HEART_SIZE   = MAX_SCALE_I / 4; // Minimum heart size.
+const uint_fast16_t MIN_HEART_RES    = 8;        // Minimum heart size.
+const uint_fast16_t MAX_HEART_RES    = 128;      // Minimum heart size.
 
-const uint16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lines.
-const uint16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
+const uint_fast16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lines.
+const uint_fast16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
 
 
 
@@ -204,48 +216,48 @@ const uint16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
 /////////////////////////////////////////////////////////////////////////////////
 
 // Current coordinates and angle.
-volatile float CurrentX = 0.0;      // Current location of ball (X).
-volatile float CurrentY = 0.0;      // Current location of ball (Y).
-volatile float RadAngle = 0.0;      // Current angle of ball from the origin (radians).
+volatile double CurrentX = 0.0;      // Current location of ball (X).
+volatile double CurrentY = 0.0;      // Current location of ball (Y).
+volatile double RadAngle = 0.0;      // Current angle of ball from the origin (radians).
 
 // General runtime variables.
-volatile int16_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
-int16_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
-volatile int16_t RotSteps     = 0;      // Current # steps rotary is away from 0.
-int16_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
-volatile bool    RotOn        = false;  // 'true' if rotary axis is enabled to move.
-volatile bool    InOutOn      = false;  // 'true' if inout axis is enabled to move.
-volatile uint8_t DirInOut     = OUT;    // Current In/Out direction.
-volatile uint8_t DirRot       = CW;     // Current Rotary direction.
-int16_t          InOutDelay   = 100;    // ISR delay for In/Out motor.
-int16_t          RotDelay     = 100;    // ISR delay for Rotary motor.
-uint32_t         RandomSeed   = 0;      // RNG seed used at startup.
-volatile uint16_t MRPointCount = 0; // Count of the number of points displayed.
-float            RotSpeedFactor = 1.0;  // Multiplicative factor for rotational speed.
-float            InOutSpeedFactor = 1.0;// Multiplicative factor for in/out speed.
-bool             Pausing      = false;  // 'true' when pausing do to pot setting.
-volatile int16_t InLimit      = 0;      // Inner limit where MotorRatios() will
-                                        // change direction or finish.
-volatile int16_t OutLimit     = MAX_SCALE_I; // Outer limit where MotorRatios()
-                                        // will change direction or finish.
-int16_t          SpeedDelay   = SPEED_DELAY_MAX_VAL;
-                                        // Active speed delay value.
-bool             RemoteSpeedDelay = false; // 'true' if remotely setting speed.
-int16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
-bool             RemoteBrightness = false;
-                                        // 'true' if remotely setting brightness.
-bool             RemotePause  = false;  // 'true' if pausing motionremotely.
-bool             AbortShape   = false;  // 'true' if aborting ghe current shape.
-uint16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
-bool             RandomSeedChanged = false;
-                                        // 'true' when random seed has been change.
+volatile int_fast32_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
+int_fast16_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
+volatile int_fast32_t RotSteps     = 0;      // Current # steps rotary is away from 0.
+int_fast16_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
+volatile bool         RotOn        = false;  // 'true' if rotary axis is enabled to move.
+volatile bool         InOutOn      = false;  // 'true' if inout axis is enabled to move.
+volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
+volatile uint_fast8_t DirRot       = CW;     // Current Rotary direction.
+int_fast16_t          InOutDelay   = 400;    // ISR delay for In/Out motor (uSec).
+int_fast16_t          RotDelay     = 400;    // ISR delay for Rotary motor (uSec).
+uint_fast32_t         RandomSeed   = 0;      // RNG seed used at startup.
+volatile uint_fast16_t MRPointCount = 0;     // Count of the number of points displayed.
+double               RotSpeedFactor= 1.0;   // Multiplicative factor for rotational speed.
+double               InOutSpeedFactor= 1.0; // Multiplicative factor for in/out speed.
+bool                  Pausing      = false;  // 'true' when pausing do to pot setting.
+volatile int_fast16_t InLimit      = 0;      // Inner limit where MotorRatios() will
+                                             // change direction or finish.
+volatile int_fast16_t OutLimit     = MAX_SCALE_I; // Outer limit where MotorRatios()
+                                             // will change direction or finish.
+         int_fast16_t SpeedDelay   = SPEED_DELAY_MAX_VAL;
+                                             // Active speed delay value.
+bool                  RemoteSpeedDelay = false; // 'true' if remotely setting speed.
+int_fast16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
+bool                  RemoteBrightness = false;   // 'true' if remotely setting brightness.
+bool                  RemotePause  = false;  // 'true' if pausing motionremotely.
+bool                  AbortShape   = false;  // 'true' if aborting ghe current shape.
+uint_fast16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
+bool                  RandomSeedChanged = false;  // 'true' when random seed has been change.
 
 
 /////////////////////////////////////////////////////////////////////////////////
 // F O R W A R D   D E C L A R A T I O N S
 /////////////////////////////////////////////////////////////////////////////////
-void MotorRatios(float ratio, bool multiplePoints,
-                 int16_t inLimit = 0, int16_t outLimit = MAX_SCALE_I);
+void    MotorRatios(double ratio, bool multiplePoints,
+                 int_fast16_t inLimit = 0, int_fast16_t outLimit = MAX_SCALE_I);
+int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data);
+int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data);
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -259,13 +271,13 @@ void MotorRatios(float ratio, bool multiplePoints,
 /////////////////////////////////////////////////////////////////////////////////
 struct Coordinate
 {
-    Coordinate(int8_t px, int8_t py)
+    Coordinate(int_least8_t px, int_least8_t py)
     {
         x = px;
         y = py;
     }
-    int8_t x;   // X coordinate.
-    int8_t y;   // Y coordinate.
+    int_least8_t x;   // X coordinate.
+    int_least8_t y;   // Y coordinate.
 }; // End Coordinate.
 
 
@@ -278,9 +290,9 @@ struct Coordinate
 /////////////////////////////////////////////////////////////////////////////////
 struct PlotInfo
 {
-    const    Coordinate *m_Plot;    // Pointer to a plot array.
-    uint16_t             m_Size;    // Size of the array pointed to by m_Plot.
-    bool                 m_Rotate;  // True to allow rotation.
+    const Coordinate *m_Plot;    // Pointer to a plot array.
+    uint_fast16_t     m_Size;    // Size of the array pointed to by m_Plot.
+    bool              m_Rotate;  // True to allow rotation.
 }; // End PlotInfo.
 
 
@@ -308,7 +320,7 @@ public:
     //   - delay  : The number of execution cycles that must elapse between
     //              executions of *pShape().
     /////////////////////////////////////////////////////////////////////////////
-    ShapeInfo(void (*pShape)(), uint16_t delay)
+    ShapeInfo(void (*pShape)(), uint_fast16_t delay)
     {
         // Initialize our data based on our arguments.
         m_pShape    = pShape;
@@ -327,7 +339,7 @@ public:
     //             It is incremented by the caller each time a shape is
     //             generated.
     /////////////////////////////////////////////////////////////////////////////
-    bool MakeShape(uint16_t cycle)
+    bool MakeShape(uint_fast16_t cycle)
     {
         // Assume we're going to fail.
         bool retval = false;
@@ -365,9 +377,9 @@ private:
     ShapeInfo();
     ShapeInfo &operator=(ShapeInfo &);
 
-    void (*m_pShape)();     // Pointer to function to execute if not too soon.
-    uint16_t m_Delay;       // Number of iterations between consecutive executions.
-    uint16_t m_LastCycle;   // Iteration that we last executed.
+    void         (*m_pShape)();  // Pointer to function to execute if not too soon.
+    uint_fast16_t m_Delay;       // Number of iterations between consecutive executions.
+    uint_fast16_t m_LastCycle;   // Iteration that we last executed.
 }; // End class ShapeInfo.
 
 
@@ -471,7 +483,7 @@ const Coordinate JMCPlot[] =
 void HandleRemoteCommands()
 {
     // Keep track of the last time we received a command.
-    static uint32_t lastMessageMs = millis();
+    static uint_fast32_t lastMessageMs = millis();
 
     // See if it's been too long since our last serial message.
     // If so, then undo any remote controls that may be in effect.
@@ -488,9 +500,9 @@ void HandleRemoteCommands()
     if (Serial.available() > 0)
     {
         // Setup a buffer to hold any received commands.
-        const uint16_t BUFLEN = 14;
+        const uint_fast16_t BUFLEN = 40;
         char buf[BUFLEN];
-        uint16_t len = 0;
+        uint_fast16_t len = 0;
 
         // Got a message.  Update our timeout base.
         lastMessageMs = millis();
@@ -501,12 +513,12 @@ void HandleRemoteCommands()
         {
             // Increase speed.
             case 'F':
-                SpeedDelay -= 20;
+                SpeedDelay -= 80;
                 RemoteSpeedDelay = true;
             break;
             // Decrease speed.
             case 'S':
-                SpeedDelay += 20;
+                SpeedDelay += 80;
                 RemoteSpeedDelay = true;
             break;
             // Restore local control of speed;
@@ -553,8 +565,7 @@ void HandleRemoteCommands()
             // Get the last random seed.
             // Note that the 'R' case falls through to this case.
             case 'G':
-                LOG_U(LOG_ALWAYS, RandomSeed);
-                LOG_U(LOG_ALWAYS, "\n");
+                LOG_F(LOG_ALWAYS, "%ul\n", RandomSeed);
                 break;
             // Next shape - Abort the current shape and start the next.
             case 'N':
@@ -573,87 +584,6 @@ void HandleRemoteCommands()
     }
 } // End HandleRemoteCommands().
 
-/////////////////////////////////////////////////////////////////////////////////
-// GenerateRandomSeed()
-//
-// Generates a 31 bit random seed using the specified (hopefully) unused analog
-// input pin.  This version is based on the work of "celafon" as posted at:
-// https://forum.arduino.cc/t/best-way-of-random-seed/640617/7
-//
-// In order to conserve memory, this version is hard coded to generate a 31-bit
-// seed, and takes the analog input pin as an argument.
-//
-// Arguments:
-//   pin - The unused analog input pin that will be used to generate the seed.
-//
-// Returns:
-//  If 'pin' specifies a valid analog input pin, a 32-bit random seed is returned.
-//  Otherwise, a random value based on micros() will be returned.
-//
-// Notes:
-//   - The analog pin is returned to its entry state before exit.
-//   - This code is highly Arduino UNO dependent.  Probably won't work for other
-//     processors.
-/////////////////////////////////////////////////////////////////////////////////
-uint32_t GenerateRandomSeed(int pin)
-{
-    const uint16_t NUM_BITS           = 31;     // Number of seed bits.
-    const uint16_t BASE_INTERVAL_MS   = 1UL;    // Minumum wait time.
-    const uint16_t SAMPLE_SIGNIFICANT = 7;      // Modulus of the input sample.
-    const uint16_t SAMPLE_MULTIPLIER  = 10;     // ms per sample digit difference.
-    const uint16_t HASH_ITERATIONS    = 3;      // # iterations to generate the seed.
-
-    uint32_t result     = 0;    // Our 32-bit result seed.
-    uint16_t tempBit    = 0;    // Used to build the random seed.
-    uint16_t intervalMs = 0;    // Random delay interval for samplimg the analog.
-
-
-    // Save our current analog pin state so we can restore it later.
-    uint8_t bit  = digitalPinToBitMask(pin);
-    uint8_t port = digitalPinToPort(pin);
-    // Validate the specified pin.  If invalid, return # microseconds since startup.
-    if ((port == NOT_A_PIN) || (bit == 0) || (bit & (bit - 1)))
-    {
-        LOG_U(LOG_INFO, "Bad seed pin!\n");
-        return micros();
-    }
-
-    volatile uint8_t *modeReg = portModeRegister(port);
-    volatile uint8_t *outReg = portOutputRegister(port);
-    uint8_t modeSave = *modeReg & bit;
-    uint8_t outSave  = *outReg & bit;
-
-    // Pull the analog seed pin up, then not up in order to start a voltage decay.
-    pinMode(RANDOM_SEED_PIN, INPUT_PULLUP);
-    pinMode(RANDOM_SEED_PIN, INPUT);
-    delay(200);
-
-    // Now there will be a slow decay of the voltage, about 8 seconds,
-    // so pick a point on the curve offset by the processed previous sample:
-    for (uint16_t bits = 0; bits < NUM_BITS; bits++)
-    {
-        for (uint16_t i = 0; i < HASH_ITERATIONS; i++)
-        {
-            delay(BASE_INTERVAL_MS + intervalMs);
-
-            // Take a sample.
-            uint16_t reading = analogRead(pin);
-            tempBit ^= (reading & 1);
-
-            // Take the low "digits" of the reading and multiply it to scale
-            // it to map a new point on the decay curve:
-            intervalMs = (reading % SAMPLE_SIGNIFICANT) * SAMPLE_MULTIPLIER;
-        }
-        result |= ((uint32_t)(tempBit & 1) << bits);
-    }
-
-    // Restore the analog register to its initial state.
-    *modeReg = (*modeReg & ~bit) | modeSave;
-    *outReg  = (*outReg  & ~bit) | outSave;
-
-    return result;
-} // End GenerateRandomSeed().
-
 
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
@@ -666,19 +596,19 @@ bool RandomBool() { return (bool)random(0, 2); }
 /////////////////////////////////////////////////////////////////////////////////
 // RandomFloat()
 //
-// Returns a random float value between minVal and maxVal with 2 digits precision.
+// Returns a random double value between minVal and maxVal with 2 digits precision.
 //
 // Arguments:
-//   - minVal : Minimum value of the returned random float.
-//   - maxVal : Maximum vlaue of the returned random float.
+//   - minVal : Minimum value of the returned random double.
+//   - maxVal : Maximum vlaue of the returned random double.
 //
 // Returns:
-//   Returns a random float between the specified limits.
+//   Returns a random double between the specified limits.
 /////////////////////////////////////////////////////////////////////////////////
-float RandomFloat(float minVal, float maxVal)
+double RandomFloat(double minVal, double maxVal)
 {
-    return (float)random((uint32_t)(minVal * FLOAT_PRECISION),
-                         (uint32_t)(maxVal * FLOAT_PRECISION) + 1) / FLOAT_PRECISION;
+    return (double)random((long)(minVal * FLOAT_PRECISION),
+                           (long)(maxVal * FLOAT_PRECISION) + 1) / FLOAT_PRECISION;
 } // End RandomFloat().
 
 
@@ -693,7 +623,7 @@ float RandomFloat(float minVal, float maxVal)
 // Returns:
 //   Returns the value of the degree argument converted to radians.
 /////////////////////////////////////////////////////////////////////////////////
-float DtoR(float degrees)
+double DtoR(double degrees)
 {
     return degrees * PI_X_2 / 360.0;
 } // End DtoR().
@@ -710,7 +640,7 @@ float DtoR(float degrees)
 // Returns:
 //   Returns the value of the rads argument converted to degrees.
 /////////////////////////////////////////////////////////////////////////////////
-float RtoD(float rads)
+double RtoD(double rads)
 {
     return rads * 360.0 / PI_X_2;
 } // End RtoD().
@@ -729,7 +659,7 @@ float RtoD(float rads)
 // Returns:
 //  Returns the GCD of the two input values.
 /////////////////////////////////////////////////////////////////////////////////
-uint16_t GCD(uint16_t a, uint16_t b)
+uint_fast16_t GCD(uint_fast16_t a, uint_fast16_t b)
 {
     while (a != b)
     {
@@ -749,7 +679,7 @@ uint16_t GCD(uint16_t a, uint16_t b)
 /////////////////////////////////////////////////////////////////////////////////
 // LCM()
 //
-// Returns the least common multiple (lcm) of its 2 uint16_t arguments.
+// Returns the least common multiple (lcm) of its 2 uint_fast16_t arguments.
 //
 // Arguments:
 //  a - The first unsigned 16-bit value.
@@ -758,7 +688,7 @@ uint16_t GCD(uint16_t a, uint16_t b)
 // Returns:
 //   Always returns the lcm of 'a' and 'b'.
 /////////////////////////////////////////////////////////////////////////////////
-uint16_t LCM(uint16_t a, uint16_t b)
+uint_fast16_t LCM(uint_fast16_t a, uint_fast16_t b)
 {
     return (a * b) / GCD(a, b);
 } // End LCM().
@@ -777,9 +707,9 @@ uint16_t LCM(uint16_t a, uint16_t b)
 //  a - The (possibly) reduced 'a' value.
 //  b - The (possibly) reduced 'b' value.
 /////////////////////////////////////////////////////////////////////////////////
-void Reduce(uint16_t &a, uint16_t &b)
+void Reduce(uint_fast16_t &a, uint_fast16_t &b)
 {
-    uint16_t gcd = GCD(a, b);
+    uint_fast16_t gcd = GCD(a, b);
     a /= gcd;
     b /= gcd;
 } // End Reduce().
@@ -793,9 +723,9 @@ void Reduce(uint16_t &a, uint16_t &b)
 /////////////////////////////////////////////////////////////////////////////////
 void CalculateXY()
 {
-    float r = ((float)InOutSteps * MAX_SCALE_F) / (float)INOUT_TOTAL_STEPS;
-    CurrentX = r * cosf(RadAngle);
-    CurrentY = r * sinf(RadAngle);
+    double r = (double)(InOutSteps * MAX_SCALE_I) / (double)INOUT_TOTAL_STEPS;
+    CurrentX  = r * cos(RadAngle);
+    CurrentY  = r * sin(RadAngle);
 } // End CalculateXY().
 
 
@@ -815,7 +745,7 @@ void CalculateXY()
 //                 Higher values produce slower speeds.  Good values range from
 //                 100 to 1000.
 /////////////////////////////////////////////////////////////////////////////////
-void ForceInOut(uint16_t steps, uint8_t direction, uint16_t delay)
+void ForceInOut(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
 {
     // Limit our arguments.
     steps = min(steps, INOUT_TOTAL_STEPS + 10);
@@ -829,7 +759,7 @@ void ForceInOut(uint16_t steps, uint8_t direction, uint16_t delay)
     digitalWrite(DIR_INOUT_PIN, DirInOut);
 
     // Move the in/out axis as specified.
-    for (uint16_t x = 0; x < steps; x++)
+    for (int_fast16_t x = 0; x < steps; x++)
     {
         digitalWrite(STEP_INOUT_PIN, HIGH);
         delayMicroseconds(delay);
@@ -855,7 +785,7 @@ void ForceInOut(uint16_t steps, uint8_t direction, uint16_t delay)
 //                 Higher values produce slower speeds.  Good values range from
 //                 100 to 1000.
 /////////////////////////////////////////////////////////////////////////////////
-void ForceRot(uint16_t steps, uint8_t direction, uint16_t delay)
+void ForceRot(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
 {
     // Limit our arguments.
     delay = constrain(delay, MIN_FORCE_DELAY, MAX_FORCE_DELAY);
@@ -868,7 +798,7 @@ void ForceRot(uint16_t steps, uint8_t direction, uint16_t delay)
     digitalWrite(DIR_ROT_PIN, DirRot);
 
     // Move the rotation axis as specified.
-    for (uint16_t x = 0; x < steps; x++)
+    for (int_fast16_t x = 0; x < steps; x++)
     {
         digitalWrite(STEP_ROT_PIN, HIGH);
         delayMicroseconds(delay);
@@ -891,7 +821,7 @@ void ForceRot(uint16_t steps, uint8_t direction, uint16_t delay)
 /////////////////////////////////////////////////////////////////////////////////
 void Home()
 {
-    LOG_U(LOG_INFO, "Home()\n");
+    LOG_F(LOG_INFO, "Home()\n");
 
     // Only handle the home sensor if it exists.  The compiler will optimize the
     // following code out if USE_HOME_SENSOR is 'false'.
@@ -914,14 +844,14 @@ void Home()
         DirRot = CCW;
         while (IsRotHome())
         {
-            ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
+             ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
         }
 
         // Rotate CW until the rotary home switch is detected.
         DirRot = CW;
         while (!IsRotHome())
         {
-            ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
+             ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
         }
 
         // Disable inout to eliminate clicking on CW move.
@@ -967,13 +897,13 @@ void Home()
 //   - newX : This is the target X coordinate position.
 //   - newY : This is the target Y coordinate position.
 /////////////////////////////////////////////////////////////////////////////////
-void ReverseKinematics(float newX, float newY)
+void ReverseKinematics(double newX, double newY)
 {
     // Calculate radial distance from the origin to the target point.
-    float rTo = hypotf(newX, newY);
+    double rTo = hypot(newX, newY);
 
     // Calculate angle from the origin using atan2().
-    float angleTo = atan2f(newY, newX);
+    double angleTo = atan2(newY, newX);
 
     // atan2() returns the angle in radians in the range -pi to pi.  Convert
     // negative angle to positive.
@@ -983,14 +913,14 @@ void ReverseKinematics(float newX, float newY)
     }
 
     // Calculate the rotation steps and limit as needed.
-    RotStepsTo = roundf((angleTo * ROT_TOTAL_STEPS) / PI_X_2);
+    RotStepsTo = round((angleTo * ROT_TOTAL_STEPS) / PI_X_2);
     if (RotStepsTo >= ROT_TOTAL_STEPS)
     {
         RotStepsTo -= ROT_TOTAL_STEPS;
     }
 
     // Calculate the in/out steps and limit as needed.
-    InOutStepsTo = roundf((rTo * INOUT_TOTAL_STEPS) / MAX_SCALE_F);
+    InOutStepsTo = round((rTo * INOUT_TOTAL_STEPS) / MAX_SCALE_F);
     InOutStepsTo = constrain(InOutStepsTo, 0, INOUT_TOTAL_STEPS);
 
     // Determine whether to go IN or OUT.
@@ -1055,7 +985,7 @@ inline void DisableRot()   { digitalWrite(EN_ROT_PIN,   HIGH); }
 /////////////////////////////////////////////////////////////////////////////////
 void ExtendInOut()
 {
-    GotoXY(MAX_SCALE_F * cosf(RadAngle), MAX_SCALE_F * sinf(RadAngle));
+    GotoXY(MAX_SCALE_F * cos(RadAngle), MAX_SCALE_F * sin(RadAngle));
 } // End ExtendInOut().
 
 
@@ -1069,14 +999,14 @@ void ExtendInOut()
 //   - angle : The target angle from the origin to which the the rotary axis
 //             will move.  This move is coordinated with the system.
 /////////////////////////////////////////////////////////////////////////////////
-void RotateToAngle(float angle)
+void RotateToAngle(double angle)
 {
     // atan2() returns the angle in radians in the range -pi to pi.  Convert
     // negative angle to positive.
     angle += (angle < 0.0) ? PI_X_2 : 0.0;
 
     // Calculate the rotation steps and limit as needed.
-    RotStepsTo = (int16_t)((angle * (float)ROT_TOTAL_STEPS) / PI_X_2);
+    RotStepsTo = (int_fast16_t)((angle * (double)ROT_TOTAL_STEPS) / PI_X_2);
     if (RotStepsTo >= ROT_TOTAL_STEPS)
     {
         RotStepsTo -= ROT_TOTAL_STEPS;
@@ -1118,7 +1048,7 @@ inline bool IsRotHome()  { return !digitalRead(ROT_HOME_PIN); }
 // Arguments:
 //   x, y : The cartesian coordinates of the target position.
 /////////////////////////////////////////////////////////////////////////////////
-void MoveTo(float x, float y)
+void MoveTo(double x, double y)
 {
     // Calculate the target in/out and rotary values and start moving.
     ReverseKinematics(x, y);
@@ -1139,42 +1069,38 @@ void MoveTo(float x, float y)
 // Arguments:
 //   targetX, targetY : The cartesian coordinates of the target position.
 /////////////////////////////////////////////////////////////////////////////////
-void GotoXY(float targetX, float targetY)
+void GotoXY(double targetX, double targetY)
 {
     // Make sure we stay within the bounds of the table.
-    if ((squaref(targetX) + squaref(targetY)) > (MAX_SCALE_F * MAX_SCALE_F))
+    if ((sq(targetX) + sq(targetY)) > (MAX_SCALE_F * MAX_SCALE_F))
     {
         // They want to go beyond the limits of the table.  We compensate by
         // limiting the move to safe bounds.
-        float angle = atan2f(targetY, targetX);
-        targetX = truncf(MAX_SCALE_F * cosf(angle));
-        targetY = truncf(MAX_SCALE_F * sinf(angle));
+        double angle = atan2(targetY, targetX);
+        targetX = trunc(MAX_SCALE_F * cos(angle));
+        targetY = trunc(MAX_SCALE_F * sin(angle));
     }
-
     // Calculate the difference between target and current positions.
-    float dx = targetX - CurrentX;
-    float dy = targetY - CurrentY;
-
+    double dx = targetX - CurrentX;
+    double dy = targetY - CurrentY;
     // Calculate the total distance to travel.
-    float distance = hypotf(dx, dy);
-
+    double distance = hypot(dx, dy);
     // Calculate the number of steps required, and round.
     // Adjust stepsPerUnit according to your system.
-    uint16_t steps = (uint16_t)roundf(distance * STEPS_PER_UNIT);
-
+    uint_fast16_t steps = (uint_fast16_t)round(distance * STEPS_PER_UNIT);
     // Exit right away if the move is too small.
     if (steps != 0)
     {
         // Initialize our intermediate position variables.
-        float newX = CurrentX;
-        float newY = CurrentY;
+        double newX = CurrentX;
+        double newY = CurrentY;
 
         // Calculate the increments per step.
-        float incrementX = dx / steps;
-        float incrementY = dy / steps;
+        double incrementX = dx / steps;
+        double incrementY = dy / steps;
 
         // Break the move into manageable pieces.
-        for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
+        for (uint_fast16_t i = 0; (i < steps) && !AbortShape; i++)
         {
             // Calculate next intermediate point to move to.
             newX += incrementX;
@@ -1204,24 +1130,50 @@ void GotoXY(float targetX, float targetY)
 //   - angle            : The angle (in radians) to rotate the specified point
 //                        about the origin.
 /////////////////////////////////////////////////////////////////////////////////
-void RotateGotoXY(float targetX, float targetY, float angle)
+void RotateGotoXY(double targetX, double targetY, double angle)
 {
-    float x = targetX;
-    float y = targetY;
+    double x = targetX;
+    double y = targetY;
 
     // Perform rotation if requested.
     if (angle != 0.0)
     {
         // Transform (rotate) the target coordinates.
         {
-            x = targetX * cosf(angle) - targetY * sinf(angle);
-            y = targetY * cosf(angle) + targetX * sinf(angle);
+            x = targetX * cos(angle) - targetY * sin(angle);
+            y = targetY * cos(angle) + targetX * sin(angle);
         }
     }
 
     // Move to the (possibly rotated) target location.
     GotoXY(x, y);
 } // End RotatedGotoXY().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// ReadAPot()
+//
+// Returns a shifted value read from the specified potentiometer.
+//
+// Arguments:
+// - pot : The pin number of the pot to be read.
+//
+// Returns:
+//   Always returns the value of the specified analog input shifted right by
+//   ANALOG_SHIFT_FACTOR bits.  This is done to work around the 2350 analog in
+//   noise problem.
+//
+// Note:
+//   Due to noise problems with the 2350 ADC, we reduce our ADC resolution by
+//   4 bits (from 12 bits to 8 bits).  This is done by shifting the (noisy) 4
+//   least significant bits out, leaving only the 8  most significant bits, 
+//   which is fine for this system.  A proper fix would require hardware
+//   modification, and is not worth the effort in this case.
+/////////////////////////////////////////////////////////////////////////////////
+inline uint_fast16_t ReadAPot(int pot)
+{
+    return analogRead(pot) >> ANALOG_SHIFT_FACTOR;
+} // End ReadAPot().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1233,10 +1185,12 @@ void RotateGotoXY(float targetX, float targetY, float angle)
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateLeds()
 {
+
     // Only read left BRIGHTNESS pot if we're not being controlled remotely.
     if (!RemoteBrightness)
     {
-        int16_t brightnessKnobVal = analogRead(BRIGHTNESS_POT_PIN);
+        // The pot on the left is for the LEDs.  Read it now.
+        uint_fast16_t brightnessKnobVal = ReadAPot(BRIGHTNESS_POT_PIN);
         Brightness = map(brightnessKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
     }
@@ -1262,11 +1216,12 @@ bool UpdateSpeeds()
     // Only read the right SPEED pot if we're not being controlled remotely.
     if (!RemoteSpeedDelay)
     {
-        // Pot on the right for drawing speed or delay.
-        uint16_t speedKnobVal = analogRead(SPEED_POT_PIN);
+        // Pot on the right for drawing speed or delay.  Read it now.
+        uint_fast16_t speedKnobVal = ReadAPot(SPEED_POT_PIN);
         SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
-        keepRunning = (speedKnobVal != KNOB_MIN_VAL);
+        // Check against a value slightly higher than 0 due to ADC inaccuracies.
+        keepRunning = (speedKnobVal >= KNOB_MIN_VAL + 5);
     }
 
     // Set the values atomically.
@@ -1291,6 +1246,13 @@ bool UpdateSpeeds()
 /////////////////////////////////////////////////////////////////////////////////
 void ReadPots()
 {
+#if 0 //%%%jmc
+  static uint16_t pixelHue = 0;
+  pixelHue += 1;
+  pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(pixelHue)));
+  pixel.show();
+#endif //%%%jmc
+
     // Perform any requested remote commands.
     HandleRemoteCommands();
 
@@ -1325,9 +1287,7 @@ void Display()
 {
     LOG_F(LOG_VERBOSE, "%d \\ %d,%d, * ", MRPointCount, RotDelay, InOutDelay);
     LOG_F(LOG_VERBOSE, "%d,%d * ", InOutOn, RotOn);
-    LOG_U(LOG_VERBOSE, CurrentX);
-    LOG_U(LOG_VERBOSE, "x,y");
-    LOG_U(LOG_VERBOSE, CurrentY);
+    LOG_F(LOG_VERBOSE, "%.1f x,y %.1f", CurrentX, CurrentY);
     LOG_F(LOG_VERBOSE, " %d>%d %d>%d\n", RotSteps, RotStepsTo, InOutSteps, InOutStepsTo);
 } // End Display().
 
@@ -1343,7 +1303,7 @@ void Display()
 //   - inOutFactor : The in/out factor to apply.  May be modified if it exceeds
 //                   limits.
 /////////////////////////////////////////////////////////////////////////////////
-void SetSpeedFactors(float rotFactor, float inOutFactor)
+void SetSpeedFactors(double rotFactor, double inOutFactor)
 {
     rotFactor   = constrain(rotFactor,   MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
     inOutFactor = constrain(inOutFactor, MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
@@ -1368,7 +1328,7 @@ void SetSpeedFactors(float rotFactor, float inOutFactor)
 void EndShape()
 {
     // Announce that the shape is done.
-    LOG_U(LOG_INFO, "End Shape\n");
+    LOG_F(LOG_INFO, "End Shape\n");
 
     // If PAUSE_ON_DONE is 'false', then this entire block will be optimized out.
     if (PAUSE_ON_DONE)
@@ -1389,8 +1349,8 @@ void EndShape()
     }
 
     // Delay a bit to allow time to set speed pot back to desired value.
-    const uint32_t END_PLOT_DELAY = 3000;   // 3 second delay.
-    uint32_t startTime = millis();
+    const uint_fast32_t END_PLOT_DELAY = 3000;   // 3 second delay.
+    uint_fast32_t startTime = millis();
     while (millis() - startTime < END_PLOT_DELAY)
     {
         delay(10);
@@ -1407,7 +1367,7 @@ void EndShape()
 /////////////////////////////////////////////////////////////////////////////////
 void EndSeries()
 {
-    LOG_U(LOG_INFO, "End Series\n");
+    LOG_F(LOG_INFO, "End Series\n");
 } // End EndSeries().
 
 
@@ -1430,7 +1390,8 @@ void EndSeries()
 // Returns:
 //   The generated steps, sizeInc, and rotInc values are returned to the caller.
 /////////////////////////////////////////////////////////////////////////////////
-void GenerateSeriesSteps(uint16_t size, uint16_t &steps, uint16_t &sizeInc, float &rotInc)
+void GenerateSeriesSteps(uint_fast16_t size, uint_fast16_t &steps,
+                         uint_fast16_t &sizeInc, double &rotInc)
 {
     // Determine how many steps to take, and how much to increase size and angle.
     steps   = random(MIN_SERIES_STEPS, MAX_SERIES_STEPS);
@@ -1438,9 +1399,7 @@ void GenerateSeriesSteps(uint16_t size, uint16_t &steps, uint16_t &sizeInc, floa
     sizeInc = max(sizeInc, MIN_SERIES_INC);
     steps   = 1 + (MAX_SCALE_I - size) / sizeInc;
     rotInc  = RandomFloat(0.0, DtoR(MAX_SERIES_ANGLE));
-    LOG_F(LOG_INFO, "(%d,%d,%d,", size, steps, sizeInc);
-    LOG_U(LOG_INFO, rotInc);
-    LOG_U(LOG_INFO, "\n");
+    LOG_F(LOG_INFO, "(%d,%d,%d,%.2f)\n", size, steps, sizeInc, rotInc);
 } // End GenerateSeriesSteps().
 
 
@@ -1463,7 +1422,8 @@ void GenerateSeriesSteps(uint16_t size, uint16_t &steps, uint16_t &sizeInc, floa
 // Note: For circle, set xSize and ySize equal.  For ellipse, set xSize and
 //       ySize unequal.
 /////////////////////////////////////////////////////////////////////////////////
-void Circle(uint16_t numLobes, uint16_t xSize, uint16_t ySize, float rotation)
+void Circle(uint_fast16_t numLobes, uint_fast16_t xSize,
+            uint_fast16_t ySize, double rotation)
 {
     // Make sure all arguments are within valid limits.
     numLobes = constrain(numLobes, MIN_CIRCLE_LOBES, MAX_CIRCLE_LOBES);
@@ -1471,16 +1431,14 @@ void Circle(uint16_t numLobes, uint16_t xSize, uint16_t ySize, float rotation)
     ySize    = constrain(ySize, MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE);
 
     // Show our call.
-    LOG_F(LOG_INFO, "Circle(%d,%d,%d,", numLobes, xSize, ySize);
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_U(LOG_INFO, ")\n");
+    LOG_F(LOG_INFO, "Circle(%d,%d,%d,%.1f)\n", numLobes, xSize, ySize, RtoD(rotation));
 
     // Loop to create the curve.
-    for (uint16_t i = 0; (i <= SPIRO_NUM_POINTS)  && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS)  && !AbortShape; i++)
     {
-        float angle = SPIRO_ANGLE_BASE * (float)i;
-        float x = (float)xSize * cosf(angle);
-        float y = (float)ySize * sinf(numLobes * angle);
+        double angle = SPIRO_ANGLE_BASE * (double)i;
+        double x = (double)xSize * cos(angle);
+        double y = (double)ySize * sin(numLobes * angle);
         RotateGotoXY(x, y, rotation);
     }
 } // End Circle().
@@ -1494,10 +1452,10 @@ void Circle(uint16_t numLobes, uint16_t xSize, uint16_t ySize, float rotation)
 void RandomCircle()
 {
     // Generate some legal arguments for the call to Circle().
-    uint16_t lobes = random(MIN_CIRCLE_LOBES, MAX_CIRCLE_LOBES + 1);
-    uint16_t xSize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
-    uint16_t ySize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
-    float    rot   = RandomFloat(0.0, PI);
+    uint_fast16_t lobes = random(MIN_CIRCLE_LOBES, MAX_CIRCLE_LOBES + 1);
+    uint_fast16_t xSize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
+    uint_fast16_t ySize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
+    double       rot   = RandomFloat(0.0, PI);
 
     // Make the call to Circle().
     Circle(lobes, xSize, ySize, rot);
@@ -1511,28 +1469,28 @@ void RandomCircle()
 /////////////////////////////////////////////////////////////////////////////////
 void EllipseSeries()
 {
-    LOG_U(LOG_INFO, "EllipseSeries");
+    LOG_F(LOG_INFO, "EllipseSeries");
 
     // Usefull constants.
-    const uint16_t MIN_LOBES = 1;   // Need at least one lobe.
-    const uint16_t MAX_LOBES = 2;   // For series, no more than 2 lobes.
+    const uint_fast16_t MIN_LOBES = 1;   // Need at least one lobe.
+    const uint_fast16_t MAX_LOBES = 2;   // For series, no more than 2 lobes.
 
     // Generate some legal arguments for the calls to Circle().
-    uint16_t lobes  = random(MIN_LOBES, MAX_LOBES + 1);
-    uint16_t xSize  = random(MIN_ELLIPSE_SIZE, MAX_SCALE_I);
-    float    ratio  = RandomFloat(MIN_ELLIPSE_RATIO, MAX_ELLIPSE_RATIO);
-    uint16_t ySize  = (uint16_t)(xSize / ratio);
-             ySize  = constrain(ySize, MIN_ELLIPSE_SIZE, MAX_SCALE_I);
-    float    rot    = RadAngle;
+    uint_fast16_t lobes  = random(MIN_LOBES, MAX_LOBES + 1);
+    uint_fast16_t xSize  = random(MIN_ELLIPSE_SIZE, MAX_SCALE_I);
+    double       ratio  = RandomFloat(MIN_ELLIPSE_RATIO, MAX_ELLIPSE_RATIO);
+    uint_fast16_t ySize  = (uint_fast16_t)(xSize / ratio);
+                  ySize  = constrain(ySize, MIN_ELLIPSE_SIZE, MAX_SCALE_I);
+    double       rot    = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and
-    uint16_t steps = 0;
-    uint16_t sizeInc = 0;
-    float    rotInc = 0.0;
+    uint_fast16_t steps = 0;
+    uint_fast16_t sizeInc = 0;
+    double       rotInc = 0.0;
     GenerateSeriesSteps(xSize, steps, sizeInc, rotInc);
 
     // Loop to create the ellipse series.
-    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         // Make the call to Circle() and increment our size and rotation.
         Circle(lobes, xSize, ySize, rot);
@@ -1552,9 +1510,9 @@ void EllipseSeries()
 // Arguments:
 //   The anonymous argument is unused.
 /////////////////////////////////////////////////////////////////////////////////
-void ClearFromIn(float = 0.0)
+void ClearFromIn(double = 0.0)
 {
-    LOG_U(LOG_INFO, "ClearFromIn()\n");
+    LOG_F(LOG_INFO, "ClearFromIn()\n");
 
     // Moe to our start point (0, 0).
     GotoXY(0, 0);
@@ -1575,9 +1533,9 @@ void ClearFromIn(float = 0.0)
 // Arguments:
 //   The anonymous argument is unused.
 /////////////////////////////////////////////////////////////////////////////////
-void ClearFromOut(float = 0.0)
+void ClearFromOut(double = 0.0)
 {
-    LOG_U(LOG_INFO, "ClearFromOut()\n");
+    LOG_F(LOG_INFO, "ClearFromOut()\n");
 
     // Move the in/out arm all the way out.
     ExtendInOut();
@@ -1594,23 +1552,21 @@ void ClearFromOut(float = 0.0)
 // Arguments:
 //   - rotation : How much to rotate the raster, in radians.
 /////////////////////////////////////////////////////////////////////////////////
-void ClearLeftRight(float rotation = 0.0)
+void ClearLeftRight(double rotation = 0.0)
 {
-    LOG_U(LOG_INFO, "ClearLeftRight(");
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_U(LOG_INFO, ")\n");
+    LOG_F(LOG_INFO, "ClearLeftRight(%.1f)\n", RtoD(rotation));
 
     // Clear from left and right
-    for (int16_t i = -(int16_t)MAX_SCALE_I;
-         (i <= (int16_t)MAX_SCALE_I) && !AbortShape; i += WIPE_RASTER_INC)
+    for (int_fast16_t i = -(int_fast16_t)MAX_SCALE_I;
+         (i <= (int_fast16_t)MAX_SCALE_I) && !AbortShape; i += WIPE_RASTER_INC)
     {
         ReadPots();
 
         // Calculate xt based on circle equation.
-        float xt = sqrtf((MAX_SCALE_F * MAX_SCALE_F) - (i * i));
+        double xt = sqrtf((MAX_SCALE_F * MAX_SCALE_F) - (i * i));
         RotateGotoXY(xt,  i, rotation);
         RotateGotoXY(-xt, i, rotation);
-        float newY = i + WIPE_RASTER_INC / 2;
+        double newY = i + WIPE_RASTER_INC / 2;
         if (newY <= MAX_SCALE_F)
         {
             // Move to -xt, newY with rotation.
@@ -1628,7 +1584,7 @@ void ClearLeftRight(float rotation = 0.0)
 // An array of pointers to functions that perform wipes on the table (i.e. they
 // clear/erase the table).
 /////////////////////////////////////////////////////////////////////////////////
-void (*const Wipes[])(float) =
+void (*const Wipes[])(double) =
 {
     ClearFromIn,
     ClearFromOut,
@@ -1654,7 +1610,7 @@ void RandomWipe()
     Home();
 
     // Select a random wipe and execute it.
-    uint16_t index = random(0, sizeof(Wipes) / sizeof(Wipes[0]));
+    size_t index = random(0, sizeof(Wipes) / sizeof(Wipes[0]));
     (*Wipes[index])(RandomFloat(0.0, PI));
 } // End RandomWipe().
 
@@ -1674,7 +1630,8 @@ void RandomWipe()
 //   - res    : Resolution of points per loop.  Larger values generate smoother
 //              curves.
 /////////////////////////////////////////////////////////////////////////////////
-void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, uint16_t res)
+void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
+            uint_fast16_t ySize,  uint_fast16_t res)
 {
     // Limit our input values.
     fixedR = constrain(fixedR, MIN_CLOVER_VAL, MAX_CLOVER_VAL);
@@ -1689,14 +1646,14 @@ void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, ui
     Reduce(fixedR, outerR);
 
     // Setup some variables.
-    float baseAngle = PI_X_2 / res;
-    float rSum      = (float)(fixedR + outerR);
+    double baseAngle = PI_X_2 / res;
+    double rSum      = (double)(fixedR + outerR);
     xSize = constrain(xSize, MIN_CLOVER_SIZE, MAX_SCALE_I) / (fixedR + 2 * outerR);
     ySize = constrain(ySize, MIN_CLOVER_SIZE, MAX_SCALE_I) / (fixedR + 2 * outerR);
 
     // Calculate the number of cycles to complete the plot.
-    float    angleFactor = rSum / outerR;
-    uint32_t cycles = 1;
+    double    angleFactor = rSum / outerR;
+    uint_fast32_t cycles = 1;
     if (fixedR % outerR != 0)
     {
         cycles = LCM(fixedR, outerR) / fixedR;
@@ -1706,25 +1663,24 @@ void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, ui
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.  Since we always start our shape with a 0 degree angle,
     // we can use the current position angle as the amount we need to rotate.
-    float offsetAngle = RadAngle;
+    double offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint32_t i = 0; (i <= res * cycles) && !AbortShape; i++)
+    for (uint_fast32_t i = 0; (i <= res * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
         if (LOG_CYCLES && (i % res == 0))
         {
-            LOG_U(LOG_CYCLES, cycles - i / res);
-            LOG_F(LOG_CYCLES, "\n");
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / res);
         }
 
         // Calculate the angle for this point.
-        float angle = baseAngle * (float)i;
+        double angle = baseAngle * (double)i;
 
         // Calculate the Spirograph coordinates.
-        float x = rSum * cosf(angle) - outerR * cosf(angleFactor * angle);
-        float y = rSum * sinf(angle) - outerR * sinf(angleFactor * angle);
+        double x = rSum * cos(angle) - outerR * cos(angleFactor * angle);
+        double y = rSum * sin(angle) - outerR * sin(angleFactor * angle);
 
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(xSize * x, ySize * y, offsetAngle);
@@ -1740,8 +1696,8 @@ void Clover(uint16_t fixedR, uint16_t outerR, uint16_t xSize, uint16_t ySize, ui
 void RandomClover()
 {
     // Generate some legal arguments for the call to Clover().
-    uint16_t a = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
-    uint16_t b = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
+    uint_fast16_t a = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
+    uint_fast16_t b = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
 
     // Make sure our random values are not equal.
     while (a == b)
@@ -1749,9 +1705,9 @@ void RandomClover()
         b = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
     }
 
-    uint16_t xSize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
-    uint16_t ySize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
-    uint16_t res   = random(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
+    uint_fast16_t xSize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t ySize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t res   = random(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
 
     // Make the call to Rose().
     Clover(a, b, xSize, ySize, res);
@@ -1769,27 +1725,25 @@ void RandomClover()
 //   - res      : Resolution of points per loop.  Larger values generate smoother
 //                curves.
 /////////////////////////////////////////////////////////////////////////////////
-void Heart(uint16_t size, float rotation, uint16_t res)
+void Heart(uint_fast16_t size, double rotation, uint_fast16_t res)
 {
     // Make sure the heart fits within the table.
-    float scale = 0.9 * (float)constrain(size, MIN_HEART_SIZE, MAX_SCALE_I);
-    res = constrain(res, MIN_HEART_RES, MAX_HEART_RES);
-    float baseAngle = PI_X_2 / (float)res;
+    double scale     = 0.9 * (double)constrain(size, MIN_HEART_SIZE, MAX_SCALE_I);
+    res               = constrain(res, MIN_HEART_RES, MAX_HEART_RES);
+    double baseAngle = PI_X_2 / (double)res;
 
-    LOG_F(LOG_INFO, "Heart(%d,", size);
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_F(LOG_INFO, ",%d)\n", res);
+    LOG_F(LOG_INFO, "Heart(%d,%.1f,%d)\n", size, RtoD(rotation), res);
 
     // Loop to create the heart.
-    for (uint16_t i = 0; (i <= res) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= res) && !AbortShape; i++)
     {
-        float angle = baseAngle * (float)i;
-        float x = scale * powf(sinf(angle), 3.0);
-        float y = scale *
-                    ((13.0 / 16.0) * cosf(angle) +
-                    (-5.0 / 16.0) * cosf(2.0 * angle) +
-                    (-2.0 / 16.0) * cosf(3.0 * angle) +
-                    (-1.0 / 16.0) * cosf(4.0 * angle));
+        double angle = baseAngle * (double)i;
+        double x = scale * powf(sin(angle), 3.0);
+        double y = scale *
+                    ((13.0 / 16.0) * cos(angle) +
+                    (-5.0 / 16.0) * cos(2.0 * angle) +
+                    (-2.0 / 16.0) * cos(3.0 * angle) +
+                    (-1.0 / 16.0) * cos(4.0 * angle));
         RotateGotoXY(x, y, rotation);
     }
 } // End Heart().
@@ -1802,21 +1756,21 @@ void Heart(uint16_t size, float rotation, uint16_t res)
 /////////////////////////////////////////////////////////////////////////////////
 void HeartSeries()
 {
-    LOG_U(LOG_INFO, "HeartSeries");
+    LOG_F(LOG_INFO, "HeartSeries");
 
     // Generate some legal arguments for the calls to Heart().
-    uint16_t size = random(MIN_HEART_SIZE, (3 * MAX_SCALE_I / 4) + 1);
-    float    rot  = RadAngle;
-    uint16_t res  = random(MIN_HEART_RES, MAX_HEART_RES + 1);
+    uint_fast16_t size = random(MIN_HEART_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    double       rot  = RadAngle;
+    uint_fast16_t res  = random(MIN_HEART_RES, MAX_HEART_RES + 1);
 
     // Determine how many steps to take, and how much to increase size and angle.
-    uint16_t steps = 0;
-    uint16_t sizeInc = 0;
-    float    rotInc = 0.0;
+    uint_fast16_t steps   = 0;
+    uint_fast16_t sizeInc = 0;
+    double       rotInc  = 0.0;
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the Heart series.
-    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         // Make the call to Heart() and increment our size and rotation.
         Heart(size, rot, res);
@@ -1851,23 +1805,24 @@ void HeartSeries()
 //         created.  If 'multiplePoints' is 'false', the curve will terminate once
 //         the in/out arm reaches either of its extents.
 /////////////////////////////////////////////////////////////////////////////////
-void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outLimit)
+void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
+                 int_fast16_t outLimit)
 {
     // Make sure we have a valid ratio.
     ratio = constrain(ratio, MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
 
     // Update our variable in/out limits.
-    inLimit  = constrain(inLimit,  0, (int16_t)(8 * MAX_SCALE_I / 10));
-    outLimit = constrain(outLimit, inLimit + 10, (int16_t)MAX_SCALE_I);
+    inLimit  = constrain(inLimit,  0, (int_fast16_t)(8 * MAX_SCALE_I / 10));
+    outLimit = constrain(outLimit, inLimit + 10, (int_fast16_t)MAX_SCALE_I);
 
     // Show our call.
-    LOG_F(LOG_INFO, "MotorRatios(");
-    LOG_U(LOG_INFO, ratio);
-    LOG_F(LOG_INFO, ",%d,%d,%d)\n", multiplePoints, inLimit, outLimit);
+    LOG_F(LOG_INFO, "MotorRatios(%.1f,%d,%d,%d)\n", ratio, multiplePoints, inLimit, outLimit);
 
     // Convert our in out units to in/out motor steps.
-    InLimit  = ((int32_t)inLimit  * (int32_t)INOUT_TOTAL_STEPS) / (int32_t)MAX_SCALE_I;
-    OutLimit = ((int32_t)outLimit * (int32_t)INOUT_TOTAL_STEPS) / (int32_t)MAX_SCALE_I;
+    InLimit  = ((int_fast32_t)inLimit  * (int_fast32_t)INOUT_TOTAL_STEPS) /
+                (int_fast32_t)MAX_SCALE_I;
+    OutLimit = ((int_fast32_t)outLimit * (int_fast32_t)INOUT_TOTAL_STEPS) /
+                (int_fast32_t)MAX_SCALE_I;
 
     // Initialize the speed factors for the motors based on our ratio argument.
     if (ratio >= 1.0)
@@ -1881,7 +1836,7 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
 
     // Try to guess how many multiple points to generate.
     // This calculation could use some work.
-    uint32_t cycles = 1;
+    uint_fast32_t cycles = 1;
     if (multiplePoints)
     {
         if (ratio > 1.0)
@@ -1893,7 +1848,7 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
         }
         else
         {
-            cycles = min((uint32_t)(40.0 / ratio), 2 * MAX_CYCLES);
+            cycles = min((uint_fast32_t)(40.0 / ratio), 2 * MAX_CYCLES);
         }
     }
 
@@ -1931,18 +1886,17 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
         // If LOG_CYCLES is 'false' then this entire block wiil be optimized out.
         if (LOG_CYCLES)
         {
-            static uint16_t lastMRPoints = 0;
+            static uint_fast16_t lastMRPoints = 0;
             if (lastMRPoints != MRPointCount)
             {
-                LOG_U(LOG_CYCLES, MRPointCount);
-                LOG_U(LOG_CYCLES, "\n");
+                LOG_F(LOG_CYCLES,"%d\n", MRPointCount);
                 lastMRPoints = MRPointCount;
             }
         }
     }
 
     // Restore the default in/out limits and speed factors.
-    InLimit = 0;
+    InLimit  = 0;
     OutLimit = MAX_SCALE_I;
     SetSpeedFactors(1.0, 1.0);
     CalculateXY();       // Update our current position variables.
@@ -1957,7 +1911,7 @@ void MotorRatios(float ratio, bool multiplePoints, int16_t inLimit, int16_t outL
 void RandomRatios()
 {
     // Generate a normalized ratio value for the call to MotorRatios().
-    float ratio = RandomFloat(1.0, MAX_MOTOR_RATIO / 3.0);
+    double ratio = RandomFloat(1.0, MAX_MOTOR_RATIO / 3.0);
 
     // Randomly select whether to generate a value less than 1.0.  Could have
     // selected a random ratio from (1.0 / MAX_MOTOR_RATIO) to MAX_MOTOR_RATIO / 3.0.
@@ -1967,11 +1921,6 @@ void RandomRatios()
     {
         ratio = RandomFloat(0.1 / (MAX_MOTOR_RATIO / 3.0), 1.0);
     }
-
-    // Show our call.
-    LOG_U(LOG_INFO, "MotorRatios(");
-    LOG_U(LOG_INFO, ratio);
-    LOG_U(LOG_INFO, ",true)\n");
 
     // Make the call to MotorRatios().
     MotorRatios(ratio, true);
@@ -1986,7 +1935,7 @@ void RandomRatios()
 void RandomRatiosRing()
 {
     // Generate a normalized ratio value for the call to MotorRatios().
-    float ratio = RandomFloat(1.0, MAX_MOTOR_RATIO / 3.0);
+    double ratio = RandomFloat(1.0, MAX_MOTOR_RATIO / 3.0);
 
     // Randomly select whether to generate a value less than 1.0.  Could have
     // selected a random ratio from (1.0 / MAX_MOTOR_RATIO) to MAX_MOTOR_RATIO / 3.0.
@@ -1997,13 +1946,11 @@ void RandomRatiosRing()
         ratio = RandomFloat(0.1 / (MAX_MOTOR_RATIO / 3.0), 1.0);
     }
 
-    int16_t inLimit  = random(0, (int16_t)(0.8 * MAX_SCALE_F) + 1);
-    int16_t outLimit = random(inLimit + 10, (int16_t)MAX_SCALE_I + 1);
+    int_fast16_t inLimit  = random(0, (int_fast16_t)(0.8 * MAX_SCALE_F) + 1);
+    int_fast16_t outLimit = random(inLimit + 10, (int_fast16_t)MAX_SCALE_I + 1);
 
     // Show our call.
-    LOG_U(LOG_INFO, "MotorRatios(");
-    LOG_U(LOG_INFO, ratio);
-    LOG_F(LOG_INFO, ",true,%d,%d)\n", inLimit, outLimit);
+    LOG_F(LOG_INFO, "MotorRatios(%f,true,%d,%d)\n", ratio, inLimit, outLimit);
 
     // Make the call to MotorRatios().
     MotorRatios(ratio, true, inLimit, outLimit);
@@ -2018,7 +1965,7 @@ void RandomRatiosRing()
 /////////////////////////////////////////////////////////////////////////////////
 const PlotInfo Plots[] =
 {
-    {JMCPlot,  sizeof(JMCPlot) / sizeof(JMCPlot[0]),   false},
+    {JMCPlot,  sizeof(JMCPlot)  / sizeof(JMCPlot[0]),  false},
     {MazePlot, sizeof(MazePlot) / sizeof(MazePlot[0]), true}
 }; // End Plots[].
 
@@ -2033,24 +1980,24 @@ const PlotInfo Plots[] =
 //   - size   : The size of the array (= # Coordinate instances).
 //   - rotate : Set 'true' to allow rotation.  'false' otherwise.
 /////////////////////////////////////////////////////////////////////////////////
-void PlotShapeArray(const Coordinate shape[], uint16_t size, bool rotate)
+void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate)
 {
     // Show our call.
-    LOG_F(LOG_INFO, "PlotShapeArray(%d,%d,%d)\n", (int)shape, size, rotate);
+    LOG_F(LOG_INFO, "PlotShapeArray(0x%x,%d,%d)\n", (int)shape, size, rotate);
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.
-    float rotation = (rotate ? (RadAngle - atan2f(shape[0].y, shape[0].x)) : 0.0);
+    double rotation = (rotate ? (RadAngle - atan2(shape[0].y, shape[0].x)) : 0.0);
 
     // Simply loop through the array, plotting each Coordinate.
-    for (uint16_t i = 0; (i < size) && !AbortShape; i++)
+    for (size_t i = 0; (i < size) && !AbortShape; i++)
     {
         // Update LEDs and speeds.
         ReadPots();
 
         // Pick out the X and Y values and go to them.
-        float x = shape[i].x;
-        float y = shape[i].y;
+        double x = shape[i].x;
+        double y = shape[i].y;
         RotateGotoXY(x, y, rotation);
 
         // NOTE: Here is a rudimentary single stepping mechanism.  It can be used
@@ -2061,11 +2008,7 @@ void PlotShapeArray(const Coordinate shape[], uint16_t size, bool rotate)
         if (LOG_STEP)
         {
             // Display the current index and position.
-            LOG_F(LOG_STEP, "%d   ", i);
-            LOG_U(LOG_STEP, x);
-            LOG_U(LOG_STEP, ",");
-            LOG_U(LOG_STEP, y);
-            LOG_U(LOG_STEP, "\n");
+            LOG_F(LOG_STEP, "%d   %.1f,%.1f\n", i, x, y);
 
             // Loop to handle step commands.  Space to step to the next coordinate,
             // and '-' to step to the previous coordinate.
@@ -2104,7 +2047,7 @@ void PlotShapeArray(const Coordinate shape[], uint16_t size, bool rotate)
 void RandomPlot()
 {
     // Select a random one and execute it.
-    uint16_t index = random(0, sizeof(Plots) / sizeof(Plots[0]));
+    size_t index = random(0, sizeof(Plots) / sizeof(Plots[0]));
     PlotShapeArray(Plots[index].m_Plot, Plots[index].m_Size, Plots[index].m_Rotate);
 } // End RandomPlot().
 
@@ -2119,21 +2062,19 @@ void RandomPlot()
 //   - size     : Size of the polygon.
 //   - rotation : How much to rotate the polygon, in radians.
 /////////////////////////////////////////////////////////////////////////////////
-void Polygon(uint16_t numSides, uint16_t size, float rotation)
+void Polygon(uint_fast16_t numSides, uint_fast16_t size, double rotation)
 {
     // Make sure all arguments are within valid limits.
-    numSides = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
-    float scale = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+    numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
+    double scale = (double)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
-    LOG_F(LOG_INFO, "Polygon(%d,%d,", numSides, size);
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_U(LOG_INFO, ")\n");
+    LOG_F(LOG_INFO, "Polygon(%d,%d,%.1f)\n", numSides, size, RtoD(rotation));
 
     // Loop to create the (possibly rotated) polygon.
-    for (uint16_t i = 0; (i <= numSides) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= numSides) && !AbortShape; i++)
     {
-        float angle = rotation + (PI_X_2 * (float)i) / (float)numSides;
-        GotoXY(scale * cosf(angle), scale * sinf(angle));
+        double angle = rotation + (PI_X_2 * (double)i) / (double)numSides;
+        GotoXY(scale * cos(angle), scale * sin(angle));
     }
 } // End Polygon().
 
@@ -2145,21 +2086,21 @@ void Polygon(uint16_t numSides, uint16_t size, float rotation)
 /////////////////////////////////////////////////////////////////////////////////
 void PolygonSeries()
 {
-    LOG_U(LOG_INFO, "PolygonSeries");
+    LOG_F(LOG_INFO, "PolygonSeries");
 
     // Generate some legal arguments for the calls to Polygon().
-    uint16_t sides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint16_t size  = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
-    float    rot   = RadAngle;
+    uint_fast16_t sides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size  = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    double       rot   = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and angle.
-    uint16_t steps = 0;
-    uint16_t sizeInc = 0;
-    float    rotInc = 0.0;
+    uint_fast16_t steps = 0;
+    uint_fast16_t sizeInc = 0;
+    double       rotInc = 0.0;
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the polygon series.
-    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         // Make the call to Polygon() and increment our size and rotation.
         Polygon(sides, size, rot);
@@ -2177,18 +2118,18 @@ void PolygonSeries()
 /////////////////////////////////////////////////////////////////////////////////
 void RandomLines()
 {
-    LOG_U(LOG_INFO, "RandomLines()\n");
+    LOG_F(LOG_INFO, "RandomLines()\n");
 
     // Determine how many lines to generate.
-    uint16_t numPoints = random(MIN_RANDOM_POINTS, MAX_RANDOM_POINTS);
+    uint_fast16_t numPoints = random(MIN_RANDOM_POINTS, MAX_RANDOM_POINTS);
 
     // Generate the random lines.
-    for (uint16_t i = numPoints; i; i--)
+    for (uint_fast16_t i = numPoints; i; i--)
     {
         LOG_F(LOG_INFO, "%d\n", i);
 
-        GotoXY(random(-(int16_t)MAX_SCALE_I, (int16_t)MAX_SCALE_I + 1),
-               random(-(int16_t)MAX_SCALE_I, (int16_t)MAX_SCALE_I + 1));
+        GotoXY(random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1),
+               random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1));
     }
 } // End RandomLines().
 
@@ -2206,7 +2147,8 @@ void RandomLines()
 //   - res   : Resolution of points per loop.  Larger values generate smoother
 //             curves.
 /////////////////////////////////////////////////////////////////////////////////
-void Rose(uint16_t num, uint16_t denom, uint16_t xSize, uint16_t ySize, uint16_t res)
+void Rose(uint_fast16_t num, uint_fast16_t denom, uint_fast16_t xSize,
+          uint_fast16_t ySize, uint_fast16_t res)
 {
     // Limit input values to legal range.
     num   = constrain(num,   MIN_ROSE_VAL, MAX_ROSE_VAL);
@@ -2222,24 +2164,24 @@ void Rose(uint16_t num, uint16_t denom, uint16_t xSize, uint16_t ySize, uint16_t
 
     // If exactly one of the numerator and denominator is odd, then we need to
     // double the number of cycles.
-    uint16_t parity = ((num & 1) ^ (denom & 1)) + 1;
+    uint_fast16_t parity = ((num & 1) ^ (denom & 1)) + 1;
 
-    uint16_t cycles = num * parity * res;
-    float baseAngle1 = (float)num / (float)denom;
-    float baseAngle2 = PI * denom / res / num;
+    uint_fast16_t cycles = num * parity * res;
+    double baseAngle1 = (double)num / (double)denom;
+    double baseAngle2 = PI * denom / res / num;
 
     // Loop to create the curve.
-    for (uint16_t i = 0; (i <= cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= cycles) && !AbortShape; i++)
     {
         if (LOG_CYCLES && (i % res == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", (cycles - i) / res);
         }
 
-        float theta = baseAngle2 * i;
-        float r = sinf(baseAngle1 * theta);
-        float x = xSize * r * cosf(theta);
-        float y = ySize * r * sinf(theta);
+        double theta = baseAngle2 * i;
+        double r = sin(baseAngle1 * theta);
+        double x = xSize * r * cos(theta);
+        double y = ySize * r * sin(theta);
         GotoXY(x, y);
     }
 } // End Rose().
@@ -2253,8 +2195,8 @@ void Rose(uint16_t num, uint16_t denom, uint16_t xSize, uint16_t ySize, uint16_t
 void RandomRose()
 {
     // Generate some legal arguments for the call to Rose().
-    uint16_t n = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
-    uint16_t d = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
+    uint_fast16_t n = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
+    uint_fast16_t d = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
 
     // Make sure our random values are not equal.
     while (d == n)
@@ -2262,9 +2204,9 @@ void RandomRose()
         d = random(MIN_ROSE_VAL, MAX_ROSE_VAL);
     }
 
-    uint16_t xSize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
-    uint16_t ySize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
-    uint16_t res   = random(MIN_ROSE_RES,MAX_ROSE_RES + 1 );
+    uint_fast16_t xSize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t ySize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t res   = random(MIN_ROSE_RES,MAX_ROSE_RES + 1 );
 
     // Make the call to Rose().
     Rose(n, d, xSize, ySize, res);
@@ -2283,47 +2225,45 @@ void RandomRose()
 //    - r      : Radius of the rolling circle.
 //    - a      : Distance from the center of the rolling circle.
 /////////////////////////////////////////////////////////////////////////////////
-void Spirograph (uint16_t fixedR, uint16_t r, uint16_t a)
+void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, MAX_SCALE_I);
-    r = constrain(r, MIN_SPIRO_SMALLR, fixedR - 5);
-    a = constrain(a, MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    r      = constrain(r, MIN_SPIRO_SMALLR, fixedR - 5);
+    a      = constrain(a, MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
 
     // Show our call.
     LOG_F(LOG_INFO, "Spirograph(%d,%d,%d)\n", fixedR, r, a);
 
-    float          rDiff      = (float)(fixedR - r);
-                                           // Difference between fixed radius and r.
-    float          rDiffRatio = rDiff / r; // Ratio for later use.
+    double rDiff      = (double)(fixedR - r); // Difference between fixed radius and r.
+    double rDiffRatio = rDiff / r;             // Ratio for later use.
 
     // Calculate the number of cycles to complete the plot.
-    uint16_t larger = max(fixedR, r);
-    uint32_t cycles = LCM(fixedR, r) / larger;
+    uint_fast16_t larger = max(fixedR, r);
+    uint_fast32_t cycles = LCM(fixedR, r) / larger;
     cycles = min(cycles, MAX_CYCLES);
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.  Since we always start our shape with a 0 degree angle,
     // we can use the current position angle as the amount we need to rotate.
-    float offsetAngle = RadAngle;
+    double offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
         if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
         {
-            LOG_U(LOG_CYCLES, cycles - i / SPIRO_NUM_POINTS);
-            LOG_F(LOG_CYCLES, "\n");
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
 
         // Calculate the angle for this point.
-        float angle = SPIRO_ANGLE_BASE * (float)i;
+        double angle = SPIRO_ANGLE_BASE * (double)i;
 
         // Calculate the Spirograph coordinates.
-        float x = rDiff * cosf(angle) + a * cosf(rDiffRatio * angle);
-        float y = rDiff * sinf(angle) - a * sinf(rDiffRatio * angle);
+        double x = rDiff * cos(angle) + a * cos(rDiffRatio * angle);
+        double y = rDiff * sin(angle) - a * sin(rDiffRatio * angle);
 
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(x, y, offsetAngle);
@@ -2339,9 +2279,9 @@ void Spirograph (uint16_t fixedR, uint16_t r, uint16_t a)
 void RandomSpirograph()
 {
     // Generate some legal arguments for the call to Spirograph().
-    uint16_t fixedR = random(MIN_SPIRO_FIXEDR, MAX_SCALE_I + 1);
-    uint16_t r = random(MIN_SPIRO_SMALLR, fixedR - 5);
-    uint16_t a = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, MAX_SCALE_I + 1);
+    uint_fast16_t r      = random(MIN_SPIRO_SMALLR, fixedR - 5);
+    uint_fast16_t a      = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
 
     // Make the call to Spirograph().
     Spirograph(fixedR, r, a);
@@ -2362,59 +2302,59 @@ void RandomSpirograph()
 //    - r2     : Radius of the second rolling circle.
 //    - d      : Distance from the center of the second rolling circle.
 /////////////////////////////////////////////////////////////////////////////////
-void Spirograph2(uint16_t fixedR, uint16_t r1, uint16_t r2, uint16_t d)
+void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
+                 uint_fast16_t d)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10));
-    r1 = constrain(r1, MIN_SPIRO_SMALLR, fixedR - 3);
-    r2 = constrain(r2, MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 8));
-    d  = constrain(d,  1, MAX_SCALE_I);
+    r1     = constrain(r1, MIN_SPIRO_SMALLR, fixedR - 3);
+    r2     = constrain(r2, MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 8));
+    d      = constrain(d,  1, MAX_SCALE_I);
 
     // Show our call.
     LOG_F(LOG_INFO, "Spirograph2(%d,%d,%d,%d)\n", fixedR, r1, r2, d);
 
-    float          rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
-    float          r12Diff    = r1 - r2;      // Difference between 2 radii of rolling circles.
-    float          baseAngle2 = rDiff / r1;   // Pre calculate to save loop execution time.
-    float          baseAngle3 = r12Diff / r2; // Pre calculate to save loop execution time.
+    double rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
+    double r12Diff    = r1 - r2;      // Difference between 2 radii of rolling circles.
+    double baseAngle2 = rDiff / r1;   // Pre calculate to save loop execution time.
+    double baseAngle3 = r12Diff / r2; // Pre calculate to save loop execution time.
 
     // Calculate the number of cycles to complete the plot.
-    uint16_t largest = max(max(fixedR, r1), d);
-    uint32_t cycles  = LCM(LCM(fixedR, r1), r2) / largest;
+    uint_fast16_t largest = max(max(fixedR, r1), d);
+    uint_fast32_t cycles  = LCM(LCM(fixedR, r1), r2) / largest;
     cycles = min(cycles, MAX_CYCLES);
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.  Since we always start our shape with a 0 degree angle,
     // we can use the current position angle as the amount we need to rotate.
-    float offsetAngle = RadAngle;
+    double offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
         if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
         {
-            LOG_U(LOG_CYCLES, cycles - i / SPIRO_NUM_POINTS);
-            LOG_F(LOG_CYCLES, "\n");
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
 
         // Calculate the angle for this point.
-        float angle1 = SPIRO_ANGLE_BASE * (float)i;
+        double angle1 = SPIRO_ANGLE_BASE * (double)i;
 
         // Calculate the position of the first rolling circle (r1) around the fixed circle.
-        float x1 = rDiff * cosf(angle1);
-        float y1 = rDiff * sinf(angle1);
+        double x1 = rDiff * cos(angle1);
+        double y1 = rDiff * sin(angle1);
 
         // Calculate the angle for the second rolling circle (r2) relative to the
         // first rolling circle.
-        float angle2 = baseAngle2 * angle1;
+        double angle2 = baseAngle2 * angle1;
 
         // Calculate the position of the second rolling circle (r2) relative to
         // the first rolling circle and offset by the distance value (d).
-        float angle3 = baseAngle3 * angle2;
-        float x2 = x1 + r12Diff * cosf(angle2) + d * cosf(angle3);
-        float y2 = y1 - r12Diff * sinf(angle2) - d * sinf(angle3);
+        double angle3 = baseAngle3 * angle2;
+        double x2 = x1 + r12Diff * cos(angle2) + d * cos(angle3);
+        double y2 = y1 - r12Diff * sin(angle2) - d * sin(angle3);
 
         // Move the drawing arm to the calculated coordinates, rotated per
         // offsetAngle value.
@@ -2431,10 +2371,10 @@ void Spirograph2(uint16_t fixedR, uint16_t r1, uint16_t r2, uint16_t d)
 void RandomSpirograph2()
 {
     // Generate some legal arguments for the call to Spirograph2().
-    uint16_t fixedR = random(MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10) + 1);
-    uint16_t r1 = random(MIN_SPIRO_SMALLR, fixedR - 2);
-    uint16_t r2 = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
-    uint16_t d  = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t r1     = random(MIN_SPIRO_SMALLR, fixedR - 2);
+    uint_fast16_t r2     = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
+    uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
 
     // Make the call to Spirograph2().
     Spirograph2(fixedR, r1, r2, d);
@@ -2453,65 +2393,64 @@ void RandomSpirograph2()
 //    - s      : Side length of the square.
 //    - d      : Offset from the center to the drawing tip.
 /////////////////////////////////////////////////////////////////////////////////
-void SpirographWithSquare(uint16_t fixedR, uint16_t s, uint16_t d)
+void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10));
-    s = constrain(s, 1, fixedR / 2);
-    d = constrain(d, 1, MAX_SCALE_I);
+    s      = constrain(s, 1, fixedR / 2);
+    d      = constrain(d, 1, MAX_SCALE_I);
 
     // Show our call.
     LOG_F(LOG_INFO, "SpirographWithSquare(%d,%d,%d)\n", fixedR, s, d);
 
     // Calculate the radius of the path traced by the center of the square.
     // Center of the square will move along a circle of radius (FIXED_R - s / 2).
-    float halfS = (float)s / 2.0;
-    float r = ((float)fixedR - halfS);
+    double halfS = (double)s / 2.0;
+    double r = ((double)fixedR - halfS);
     // Pre-calculate a few values to minimize loop time.
-    float rotAngleBase = (float)fixedR / (float)s;
+    double rotAngleBase = (double)fixedR / (double)s;
 
     // Calculate the number of cycles to complete the plot.
-    uint16_t larger = max(fixedR, s);
-    uint32_t cycles = LCM(fixedR, s) / larger;
+    uint_fast16_t larger = max(fixedR, s);
+    uint_fast32_t cycles = LCM(fixedR, s) / larger;
     cycles = min(cycles, MAX_CYCLES);
 
     // Start with an offset angle equal to the current position angle.
-    float offsetAngle = RadAngle;
+    double offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
         if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
         {
-            LOG_U(LOG_CYCLES, cycles - i / SPIRO_NUM_POINTS);
-            LOG_F(LOG_CYCLES, "\n");
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
 
         // Calculate the angle for this point.
-        float angle = SPIRO_ANGLE_BASE * (float)i;
+        double angle = SPIRO_ANGLE_BASE * (double)i;
 
         // Position of the square's center.
-        float cx = r * cosf(angle);
-        float cy = r * sinf(angle);
+        double cx = r * cos(angle);
+        double cy = r * sin(angle);
 
         // Calculate the angle of rotation of the square.
-        float rotationAngle = rotAngleBase * angle;
+        double rotationAngle = rotAngleBase * angle;
 
         // Calculate the position of the drawing tip relative to the square.
-        float tx = d * cosf(rotationAngle) - halfS * sinf(rotationAngle);
-        float ty = d * sinf(rotationAngle) + halfS * cosf(rotationAngle);
+        double tx = d * cos(rotationAngle) - halfS * sin(rotationAngle);
+        double ty = d * sin(rotationAngle) + halfS * cos(rotationAngle);
 
         // Offset from the center of the square.
-        float x = cx + tx;
-        float y = cy + ty;
+        double x = cx + tx;
+        double y = cy + ty;
 
         // The first point is used to determine how much we must rotate the shape
         // in order to start at the closest point to the current position.
         if (i == 0)
         {
-            offsetAngle = RadAngle - atan2f(y, x);
+            offsetAngle = RadAngle - atan2(y, x);
         }
 
         // Move the drawing arm to the calculated coordinates, rotated by
@@ -2529,9 +2468,9 @@ void SpirographWithSquare(uint16_t fixedR, uint16_t s, uint16_t d)
 void RandomSpirographWithSquare()
 {
     // Generate some legal arguments for the call to SpirographWithSquare().
-    uint16_t fixedR = random(MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10) + 1);
-    uint16_t s = random(1, fixedR / 2 + 1);
-    uint16_t d = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t s      = random(1, fixedR / 2 + 1);
+    uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
 
     // Make the call to SpirographWithSquare().
     SpirographWithSquare(fixedR, s, d);
@@ -2549,25 +2488,22 @@ void RandomSpirographWithSquare()
 //   - size      : Size of the star.
 //   - rotation  : How much to rotate the star, in radians.
 /////////////////////////////////////////////////////////////////////////////////
-void Star(uint16_t numPoints, float ratio, uint16_t size, float rotation)
+void Star(uint_fast16_t numPoints, double ratio, uint_fast16_t size,
+          double rotation)
 {
     // Make sure all arguments are within valid limits.
     numPoints = constrain(numPoints, MIN_STAR_POINTS, MAX_STAR_POINTS);
     ratio = constrain(ratio, MIN_STAR_RATIO, MAX_STAR_RATIO);
-    size = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+    size = (double)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
-    LOG_F(LOG_INFO, "Star(%d,", numPoints);
-    LOG_U(LOG_INFO, ratio);
-    LOG_F(LOG_INFO, ",%d,", size);
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_U(LOG_INFO, ")\n");
+    LOG_F(LOG_INFO, "Star(%d,%.1f,%d,%.1f)\n", numPoints, ratio, size, RtoD(rotation));
 
     // Loop to create the (possibly rotated) star.
-    for (uint16_t i = 0; (i <= numPoints * 2) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= numPoints * 2) && !AbortShape; i++)
     {
-        float angle = rotation + (PI * (float)i) / (float)numPoints;
-        float scale = size * ((i % 2) ? ratio : 1.0);
-        GotoXY(scale * cosf(angle), scale * sinf(angle));
+        double angle = rotation + (PI * (double)i) / (double)numPoints;
+        double scale = size * ((i % 2) ? ratio : 1.0);
+        GotoXY(scale * cos(angle), scale * sin(angle));
     }
 } // End Star().
 
@@ -2579,22 +2515,22 @@ void Star(uint16_t numPoints, float ratio, uint16_t size, float rotation)
 /////////////////////////////////////////////////////////////////////////////////
 void StarSeries()
 {
-    LOG_U(LOG_INFO, "StarSeries");
+    LOG_F(LOG_INFO, "StarSeries");
 
     // Generate some legal arguments for the calls to Star().
-    uint16_t points = random(MIN_STAR_POINTS + 2, MAX_STAR_POINTS / 4);
-    float    ratio  = RandomFloat(MIN_STAR_RATIO, MAX_STAR_RATIO);
-    uint16_t size   = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
-    float    rot    = RadAngle;
+    uint_fast16_t points = random(MIN_STAR_POINTS + 2, MAX_STAR_POINTS / 4);
+    double       ratio  = RandomFloat(MIN_STAR_RATIO, MAX_STAR_RATIO);
+    uint_fast16_t size   = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    double       rot    = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and angle.
-    uint16_t steps = 0;
-    uint16_t sizeInc = 0;
-    float    rotInc = 0.0;
+    uint_fast16_t steps   = 0;
+    uint_fast16_t sizeInc = 0;
+    double       rotInc  = 0.0;
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the Star series.
-    for (uint16_t i = 0; (i < steps) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i < steps) && !AbortShape; i++)
     {
         // Make the call to Star() and increment our size and rotation.
         Star(points, ratio, size, rot);
@@ -2618,49 +2554,47 @@ void StarSeries()
 //                Set to 'false' otherwise.
 //   - rotation : How much to rotate the star, in radians.
 /////////////////////////////////////////////////////////////////////////////////
-void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
+void SuperStar(uint_fast16_t numNodes, uint_fast16_t size, bool outline,
+               double rotation)
 {
     // Make sure all arguments are within valid limits.
-    numNodes = constrain(numNodes, MIN_POLY_SIDES, 2 * MAX_POLY_SIDES);
-    float scale = (float)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
-    float angle = rotation;
+    numNodes      = constrain(numNodes, MIN_POLY_SIDES, 2 * MAX_POLY_SIDES);
+    double scale = (double)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+    double angle = rotation;
 
     // Show our call.
-    LOG_F(LOG_INFO, "SuperStar(%d,%d,", numNodes, size);
-    LOG_U(LOG_INFO, outline);
-    LOG_U(LOG_INFO, ",");
-    LOG_U(LOG_INFO, RtoD(rotation));
-    LOG_U(LOG_INFO, ")\n");
+    LOG_F(LOG_INFO, "SuperStar(%d,%d,%d,%.1f)\n", numNodes, size, outline, RtoD(rotation));
 
     // If we are drawing a perimeter, then initial skip is 1.  Otherwise it is 2.
-    uint16_t initialSkip = (outline || (numNodes < 4)) ? 1 : 2;
+    uint_fast16_t initialSkip = (outline || (numNodes < 4)) ? 1 : 2;
 
     // Move to our start point.
-    GotoXY(scale * cosf(rotation), scale * sinf(rotation));
+    GotoXY(scale * cos(rotation), scale * sin(rotation));
 
     // Loop through all useful skip values.
-    for (uint16_t skip = initialSkip; (skip <= numNodes / 2) && !AbortShape; skip++)
+    for (uint_fast16_t skip = initialSkip;
+        (skip <= numNodes / 2) && !AbortShape; skip++)
     {
         LOG_F(LOG_DEBUG, "skip %d\n", skip);
         // Loop to visit each node with each skip value.
-        for (uint16_t nodesVisited = 0, startNode = 0;
+        for (uint_fast16_t nodesVisited = 0, startNode = 0;
              (nodesVisited < numNodes) && !AbortShape; startNode++)
         {
-            uint16_t node = startNode;
+            uint_fast16_t node = startNode;
             LOG_F(LOG_DEBUG, "start node %d\n", node);
             // Loop to visit each node.
             do
             {
                 LOG_F(LOG_DEBUG, "%d\n", node % numNodes);
-                angle = rotation + (PI_X_2 * (float)node) / (float)numNodes;
-                GotoXY(scale * cosf(angle), scale * sinf(angle));
+                angle = rotation + (PI_X_2 * (double)node) / (double)numNodes;
+                GotoXY(scale * cos(angle), scale * sin(angle));
                 node += skip;
                 nodesVisited++;
             } while (((node % numNodes) != startNode) && !AbortShape);
 
             // Return to the starting node.
-            angle = rotation + (PI_X_2 * startNode) / (float)numNodes;
-            GotoXY(scale * cosf(angle), scale * sinf(angle));
+            angle = rotation + (PI_X_2 * startNode) / (double)numNodes;
+            GotoXY(scale * cos(angle), scale * sin(angle));
 
             // Make sure that if we are not displaying the outline that we don't
             // move between adjacent nodes.
@@ -2668,15 +2602,15 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
                ((nodesVisited < numNodes) ||
                ((nodesVisited == numNodes) && (startNode == 1))))
             {
-                uint16_t tempNode = (startNode + 3) % numNodes;
+                uint_fast16_t tempNode = (startNode + 3) % numNodes;
                 LOG_F(LOG_DEBUG, "tempNode %d\n", tempNode);
-                angle = rotation + (PI_X_2 * (float)tempNode) / (float)numNodes;
-                GotoXY(scale * cosf(angle), scale * sinf(angle));
+                angle = rotation + (PI_X_2 * (double)tempNode) / (double)numNodes;
+                GotoXY(scale * cos(angle), scale * sin(angle));
             }
         }
 
         // Return to the start node.
-        GotoXY(scale * cosf(rotation), scale * sinf(rotation));
+        GotoXY(scale * cos(rotation), scale * sin(rotation));
     }
 } // End SuperStar().
 
@@ -2689,10 +2623,10 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
 void RandomSuperStar()
 {
     // Generate some legal arguments for the call to SuperStar().
-    uint16_t numPoints = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint16_t size      = random(MAX_SCALE_I / 2, MAX_SCALE_I + 1);
-    bool     outline   = RandomBool();
-    float    rot       = RadAngle;
+    uint_fast16_t numPoints = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size      = random(MAX_SCALE_I / 2, MAX_SCALE_I + 1);
+    bool          outline   = RandomBool();
+    double       rot       = RadAngle;
 
     // Make the call to SuperStar().
     SuperStar(numPoints, size, outline, rot);
@@ -2742,7 +2676,7 @@ ShapeInfo RandomShapes[] =
 void GenerateRandomShape()
 {
     // Keep track of our iteration.
-    uint16_t        index = 0;
+    size_t index = 0;
 
     // Select functions to execute at random till we find one that will actually
     // execute.
@@ -2769,7 +2703,7 @@ void GenerateRandomShape()
 /////////////////////////////////////////////////////////////////////////////////
 void ResetShapes()
 {
-    for (uint16_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
+    for (size_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
     {
         RandomShapes[i].Reset();
     }
@@ -2790,11 +2724,16 @@ void setup()
 {
     // Initially set all I/O pins as inputs with pullup per MicroChip recommendation
     // to avoid floating inputs.
-    for(int i = 0; i < 20; i++)
+    for(int i = 0; i < 23; i++)
     {
         // D0 to D13; D14 (A0) to D19 (A5) are inputs but not floating.
         pinMode(i, INPUT_PULLUP);
     }
+
+    // We wet the PWM frequency to 100 khz and set the ADC resolution to 12 bits
+    // (4096) to help reduce LED flicker at low LED knob settings.
+    analogWriteFreq(PWM_FREQ);
+    analogReadResolution(ANALOG_RESOLUTION);
 
     // Define GPIO pins per our hardware setup.
     pinMode(LIGHTS_PIN, OUTPUT);
@@ -2807,17 +2746,22 @@ void setup()
     pinMode(EN_INOUT_PIN, OUTPUT);
     pinMode(BRIGHTNESS_POT_PIN, INPUT);
     pinMode(SPEED_POT_PIN, INPUT);
-
     // Initialize the home input pin as input with pullup.
     if (USE_HOME_SENSOR)
     {
         pinMode(ROT_HOME_PIN, INPUT_PULLUP);
     }
 
-    // Initialize our serial port, and issue a "Starting" message.
-    Serial.begin(9600);
-    LOG_U(LOG_ALWAYS, "\r\nStarting\n");
+    // Initialize our serial port, wait for port to open, and issue a "Starting" message.
+    Serial.begin(115200);
+    delay(100);
+    LOG_F(LOG_ALWAYS, "\r\nStarting\n");
 
+#if 0 //%%%jmc
+pixel.begin();
+pixel.setBrightness(25);
+pixel.show();
+#endif //%%%jmc
     // Make sure we start with valid speed factors.
     RotSpeedFactor    = 1.0;
     InOutSpeedFactor  = 1.0;
@@ -2830,33 +2774,17 @@ void setup()
     Home();
     Display();
 
-    // Setup interupts for our motor driver ISRs.  Do this stuff with interrupts
-    // disabled.
-    noInterrupts();
-    TCCR1A = 0;           // Init Timer1A (for rotation motor).
-    TCCR1B = 0;           // Init Timer1B (for in/out motor).
-
-    TCCR1B |= B00000011;  // Prescaler = 64. (4 microsecond tick).
-    OCR1A = 1000;         // Timer Compare1A Register.
-    OCR1B = 1000;         // Timer Compare1B Register.
-
-    TIMSK1 |= B00000110;  // Only use one interupt.
-
-    // Raise the LED PWM frequency to eliminate blinking at dim levels.
-    // In this case set the divisor to 2, giving PWM frequency of 31372.55 Hz.
-    TCCR2B = 1;
-
-    // We're done mucking with the timer registers, so re-enable interrupts.
-    interrupts();
+    // Create an alarm for the rotational and in/out servo ISRs.  Start in 1 second.
+    add_alarm_in_us(1000000, RotaryServoIsr, NULL, false);
+    add_alarm_in_us(1000000, InOutServoIsr,  NULL, false);
 
     // Seed the random number generator.
-    RandomSeed = GenerateRandomSeed(RANDOM_SEED_PIN);
+    RandomSeed = get_rand_32();
     randomSeed(RandomSeed);
 
     // Display the random number.  It may be used in the future to repeat an
     // interesting sequence.
-    LOG_U(LOG_ALWAYS, "Seed = ");
-    LOG_U(LOG_ALWAYS, RandomSeed);
+    LOG_F(LOG_ALWAYS, "Seed = %ul\n", RandomSeed);
 
     // Initialize runtime variables to safe values.
     SpeedDelay        = SPEED_DELAY_MAX_VAL;
@@ -2869,8 +2797,35 @@ void setup()
     RandomSeedChanged = false;
     ResetShapes();
 
+
+#if 0 //%%%jmc
+  // Retry mechanism for SD card initialization
+  while (!SD.begin(config)) {
+    Serial.println("initialization failed! Retrying...");
+    delay(1000); // Wait for a second before retrying
+  }
+  Serial.println("initialization done.");
+
+  // re-open the file for reading:
+  myFile = SD.open("test.txt");
+  if (myFile) {
+    Serial.println("test.txt:");
+
+    // read from the file until there's nothing else in it:
+    while (myFile.available()) {
+      Serial.write(myFile.read());
+    }
+    // close the file:
+    myFile.close();
+  } else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening test.txt");
+  }
+#endif //%%%jmc
+
+
     // Announce that we are ready to go.
-    LOG_U(LOG_ALWAYS, "\nREADY\n");
+    LOG_F(LOG_ALWAYS, "\nREADY\n");
 } // End setup().
 
 
@@ -2889,7 +2844,7 @@ void loop()
         ClearFromIn();
 
         // Change this as desired.  It is the power-up greeting.
-        RotateToAngle(atan2f((float)JMCPlot[0].y, (float)JMCPlot[0].x));
+        RotateToAngle(atan2((double)JMCPlot[0].y, (double)JMCPlot[0].x));
 
         // Show JMC...
         PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false);
@@ -2915,7 +2870,7 @@ void loop()
         RandomSeedChanged = false;
     }
 
-    delay(100);
+    delay(10);
 } // End loop().
 
 
@@ -2928,16 +2883,8 @@ void loop()
 //
 // This is the ISR for the rotational motor.
 /////////////////////////////////////////////////////////////////////////////////
-ISR(TIMER1_COMPA_vect)
+int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    // Advance the COMPA register.
-    // Original code used the following:
-    //    OCR1A += RotDelay;
-    // The code below protects against any long delays in handling the ISR.
-    // This new code may cause some slight drift over time, but should handle
-    // exceptional cases better.
-    OCR1A = TCNT1 + RotDelay;
-
     // Used to toggle the motor's step pin.
     static bool pwm = false;
 
@@ -2945,7 +2892,7 @@ ISR(TIMER1_COMPA_vect)
     // every GEAR_RATIO number of rotary steps, in/out moves 1 step in a direction
     // depending on the mechanical setup.  inOutCompAccum accumulates the error,
     // which is then used to ganerate compensation steps for the in/out axis.
-    static int16_t inOutCompAccum = 0;
+    static int_fast16_t inOutCompAccum = 0;
 
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
@@ -2961,7 +2908,7 @@ ISR(TIMER1_COMPA_vect)
         {
             // Keep track of (accumulate) the number of rotational steps based
             // direction of rotation.
-            int16_t offsetDir = (DirRot == ROT_CAUSING_IN) ? 1 : -1;
+            int_fast16_t offsetDir = (DirRot == ROT_CAUSING_IN) ? 1 : -1;
             inOutCompAccum += offsetDir;
             RotSteps += offsetDir;
 
@@ -2996,7 +2943,7 @@ ISR(TIMER1_COMPA_vect)
                         // HIGH again.  Add a short delay between changes just
                         // to be safe.
                         digitalWrite(STEP_INOUT_PIN, LOW);
-                        delayMicroseconds(3);
+                        delayMicroseconds(5);
                         digitalWrite(STEP_INOUT_PIN, HIGH);
                     }
                     else
@@ -3004,7 +2951,7 @@ ISR(TIMER1_COMPA_vect)
                         // In/out step wil was already LOW.  Set it HIGH, then
                         // return it to its original LOW state.
                         digitalWrite(STEP_INOUT_PIN, HIGH);
-                        delayMicroseconds(3);
+                        delayMicroseconds(5);
                         digitalWrite(STEP_INOUT_PIN, LOW);
                     }
                 }
@@ -3022,7 +2969,7 @@ ISR(TIMER1_COMPA_vect)
 
             // Update our (possibly new) rotational angle which is used in background
             // processing.
-            RadAngle = ((float)RotSteps * PI_X_2) / (float)ROT_TOTAL_STEPS;
+            RadAngle = ((double)RotSteps * PI_X_2) / (double)ROT_TOTAL_STEPS;
 
             // Complete the move if we've reached our target and are not using
             // multiple points.
@@ -3040,6 +2987,11 @@ ISR(TIMER1_COMPA_vect)
             }
         } // End  if (!pwm)
     } // End if (RotOn && !Pausing)
+
+    // In order to restart the alarm, we return a negative delay time.  This
+    // causes the timer subsystem to reschedule the alarm this many microseconds
+    // from the time this ISR started.
+    return -RotDelay;
 } // End ISR(TIMER1_COMPA_vect).
 
 
@@ -3048,24 +3000,16 @@ ISR(TIMER1_COMPA_vect)
 //
 // This is the ISR for the in/out motor.
 /////////////////////////////////////////////////////////////////////////////////
-ISR(TIMER1_COMPB_vect)
+int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    // Advance the COMPB register.
-    // Original code used the following:
-    //    OCR1B += InOutDelay;
-    // The code below protects against any long delays in handling the ISR.
-    // This new code may cause some slight drift over time, but is believed to
-    // handle exceptional cases better.
-    OCR1B = TCNT1 + InOutDelay;
-
     // Used to toggle the motor's step pin.
     static bool pwm = false;
 
     // Used to remember the last iteratioins in/out direction.
-    static uint8_t lastInOutDir = DirInOut;
+    static uint_fast8_t lastInOutDir = DirInOut;
 
     // Used to determine first time use of multiple points.
-    static uint16_t lastMRPoints   = 0;
+    static uint_fast16_t lastMRPoints = 0;
 
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
@@ -3136,4 +3080,9 @@ ISR(TIMER1_COMPB_vect)
             } // End else (MRPointCount)
         } // End if (!pwm)
     } // End if (InOutOn && !Pausing)
+
+    // In order to restart the alarm, we return a negative delay time.  This
+    // causes the timer subsystem to reschedule the alarm this many microseconds
+    // from the time this ISR started.
+    return -InOutDelay;
 } // End ISR(TIMER1_COMPB_vect).

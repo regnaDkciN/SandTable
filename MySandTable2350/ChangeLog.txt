@@ -1,0 +1,89 @@
+Arduino UNO to Adafruit Metro 2350 Sand Table Changes
+=====================================================
+
+- Data type changes:
+    + Since UNO was tight on space, all data types were declared as the smallest
+      size that would do the job.  Generally (u)int16_t.  But the 2530 has lots
+      of memory (compared to the UNO), so size is unimportant.  Speed is a 
+      higher priority.  As a result, almost all data types were changed fast
+      types.  For example, uint16_6 becomes uint_fast16_t, etc.
+- Speed delay value changes:
+    + The UNO timer clock period was set up to 4 uSed.  The 2350 timer clock
+      runs at 1 uSec.  To account for this, all speed delay values were multiplied
+      by 4.  For example SPEED_DELAY_MIN_VAL was changed from 25 on the UNO to
+      100 on the 2350, etc.
+- Different ISR handling.
+    + The UNO needs to setup the timer clock rate before use:
+        TCCR1A = 0;           // Init Timer1A (for rotation motor).
+        TCCR1B = 0;           // Init Timer1B (for in/out motor).
+
+        TCCR1B |= B00000011;  // Prescaler = 64. (4 microsecond tick).
+        OCR1A = 1000;         // Timer Compare1A Register.
+        OCR1B = 1000;         // Timer Compare1B Register.
+
+        TIMSK1 |= B00000110;  // Only use one interupt.
+        
+      The 2350 already has its timer running at 1MHz.
+    + The UNO used a simple interrupt setup with "ISR(vector)" indicating that
+      a timer interrupt exists, and heads the interrupt handler itself.
+      
+        ISR(TIMER1_COMPA_vect)
+        {
+            OCR1A = TCNT1 + RotDelay;    
+            ISR code            
+        }
+        ISR(TIMER1_COMPB_vect)
+        {
+            OCR1B = TCNT1 + InOutDelay;
+            ISR code
+        }
+
+      The 2350 handles timer interrupts more normally in that the ISR must be declared
+      before use, and added to the timer list before it can be used.
+      
+        int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data);
+        int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data);
+        
+        add_alarm_in_us(1000000, RotaryServoIsr, NULL, false);
+        add_alarm_in_us(1000000, InOutServoIsr,  NULL, false);
+        
+        int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
+        {
+            ISR code
+            return -RotDelay;
+        }
+        int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
+        {
+            ISR code
+            return -InOutDelay;
+        }
+    + In order for interrupt to repeat, the UNO bumps the corresponding OCR1x 
+      register at the start of each ISR. as shown above.  The 2350 returns
+      the delay value from its ISR as a negative value, indicating that the next
+      tick should occur exactly that many microseconds after the time the current 
+      ISR triggered.
+- Speed increments/decrements in HandleRemoteCommands() are adjusted by a factor
+  of 4 to account for the timer speed differences noted above.
+- The UNO used an unused analog input and a function - GenerateRandomSeed() - to
+  generate a random seed at startup.  The 2350 has a hardware true random number
+  generator with a standard function - get_rand_32() - to generate a 32-bit
+  random number.  So GenerateRandomSeed() was removed for the 2350.
+- UNO supplies a squaref() function to square a float value.  The 2350 supplies
+  a function named sq() that does the same thing. So uses of squaref() were
+  changed to sq().
+- The rotary servo ISR contains logic to generate compensation pulses in the
+  inout servo based on rotary motion.  Part of this logic uses a short delay
+  to affect a pulse on the inout servo.  In the UNO, a pulse delay of 1 microsecond
+  was used.  However, since the 2350 is so much faster, the pulse delay was 
+  changed to 5 microseconds.
+- The 2350 includes an SD card holder and a power switch that the UNO doesn't have.
+  Both of these are mounted on edges of the card.  To accommodate these devices,
+  the mounting bumper was modified to add notches in the appropriate spots.
+- Note that the UNO firmware uses D12 as the enable for the rotation axis.  On the 
+  2350, this pin is used for other purposes, and is not brought out to a header
+  pin.  In its place, D22 is brought out on the 2350.  As a result, the 2350 
+  code was changed to initialize D22 as an output, and remapped the enable to
+  use D22 instead.
+- SerialLog changes. Removed LOG_U() macro, and replaced all serial logging with
+  LOG_F() calls that use printf() style handling.
+- Faceplate USB hole needs to be lowered by 2mm and height reduced to 10mm.
