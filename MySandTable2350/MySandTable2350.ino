@@ -1543,7 +1543,7 @@ void ClearLeftRight(double rotation = 0.0)
         ReadPots();
 
         // Calculate xt based on circle equation.
-        double xt = sqrtf((MAX_SCALE_F * MAX_SCALE_F) - (i * i));
+        double xt = sqrt((MAX_SCALE_F * MAX_SCALE_F) - (i * i));
         RotateGotoXY(xt,  i, rotation);
         RotateGotoXY(-xt, i, rotation);
         double newY = i + WIPE_RASTER_INC / 2;
@@ -1718,7 +1718,7 @@ void Heart(uint_fast16_t size, double rotation, uint_fast16_t res)
     for (uint_fast16_t i = 0; (i <= res) && !AbortShape; i++)
     {
         double angle = baseAngle * (double)i;
-        double x = scale * powf(sin(angle), 3.0);
+        double x = scale * pow(sin(angle), 3.0);
         double y = scale *
                     ((13.0 / 16.0) * cos(angle) +
                     (-5.0 / 16.0) * cos(2.0 * angle) +

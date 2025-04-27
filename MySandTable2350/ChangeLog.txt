@@ -87,3 +87,14 @@ Arduino UNO to Adafruit Metro 2350 Sand Table Changes
 - SerialLog changes. Removed LOG_U() macro, and replaced all serial logging with
   LOG_F() calls that use printf() style handling.
 - Faceplate USB hole needs to be lowered by 2mm and height reduced to 10mm.
+- Need to change the following back when compiler FP fix is released:
+    double -> float_t
+    cos    -> cosf
+    sin    -> sinf
+    hypot  -> hypotf
+    atan2  -> atan2f
+    round  -> roundf
+    trunc  -> truncf
+    sqrt   -> sqrtf
+    pow    -> powf
+    
