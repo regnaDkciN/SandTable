@@ -43,22 +43,9 @@
 //
 // Copyright (c) 2025, Joseph M. Corbett
 /////////////////////////////////////////////////////////////////////////////////
-#if 0 //%%%jmc
-#include <Adafruit_NeoPixel.h> //%%%jmc
-#include <SPI.h> //%%%jmc
-#include "SdFat.h" //%%%jmc
-#endif //%%%jmc
 #include <limits.h>     // For UINT_MAX.
 #include "SerialLog2350.h"  // For data logging macro (LOG_F).
 
-#if 0 //%%%jmc
-#define SD_CS_PIN 39
-SdFat SD;
-FsFile myFile;
-SdSpiConfig config(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(16), &SPI1);
-#define NUMPIXELS 1
-Adafruit_NeoPixel pixel(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
-#endif //%%%jmc
 
 /////////////////////////////////////////////////////////////////////////////////
 // S E R I A L   L O G   S E T T I N G S
@@ -1166,7 +1153,7 @@ void RotateGotoXY(double targetX, double targetY, double angle)
 // Note:
 //   Due to noise problems with the 2350 ADC, we reduce our ADC resolution by
 //   4 bits (from 12 bits to 8 bits).  This is done by shifting the (noisy) 4
-//   least significant bits out, leaving only the 8  most significant bits, 
+//   least significant bits out, leaving only the 8  most significant bits,
 //   which is fine for this system.  A proper fix would require hardware
 //   modification, and is not worth the effort in this case.
 /////////////////////////////////////////////////////////////////////////////////
@@ -1246,13 +1233,6 @@ bool UpdateSpeeds()
 /////////////////////////////////////////////////////////////////////////////////
 void ReadPots()
 {
-#if 0 //%%%jmc
-  static uint16_t pixelHue = 0;
-  pixelHue += 1;
-  pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(pixelHue)));
-  pixel.show();
-#endif //%%%jmc
-
     // Perform any requested remote commands.
     HandleRemoteCommands();
 
@@ -2757,11 +2737,6 @@ void setup()
     delay(100);
     LOG_F(LOG_ALWAYS, "\r\nStarting\n");
 
-#if 0 //%%%jmc
-pixel.begin();
-pixel.setBrightness(25);
-pixel.show();
-#endif //%%%jmc
     // Make sure we start with valid speed factors.
     RotSpeedFactor    = 1.0;
     InOutSpeedFactor  = 1.0;
@@ -2796,33 +2771,6 @@ pixel.show();
     ShapeIteration    = 0;
     RandomSeedChanged = false;
     ResetShapes();
-
-
-#if 0 //%%%jmc
-  // Retry mechanism for SD card initialization
-  while (!SD.begin(config)) {
-    Serial.println("initialization failed! Retrying...");
-    delay(1000); // Wait for a second before retrying
-  }
-  Serial.println("initialization done.");
-
-  // re-open the file for reading:
-  myFile = SD.open("test.txt");
-  if (myFile) {
-    Serial.println("test.txt:");
-
-    // read from the file until there's nothing else in it:
-    while (myFile.available()) {
-      Serial.write(myFile.read());
-    }
-    // close the file:
-    myFile.close();
-  } else {
-    // if the file didn't open, print an error:
-    Serial.println("error opening test.txt");
-  }
-#endif //%%%jmc
-
 
     // Announce that we are ready to go.
     LOG_F(LOG_ALWAYS, "\nREADY\n");
