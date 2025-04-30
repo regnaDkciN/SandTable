@@ -44,6 +44,8 @@ The Instructable used a single 15mm x 3mm magnet on the end of the linear arm.  
  ![Front Low Level View](https://i.imgur.com/gy55XrQ.jpeg)
 * I found that the potentiometer face plates were not very secure.  To fix this, I carefully drilled 5/64" holes through the faceplates and base plate and inserted small nails.
 * I originally added rubber feet to the bottom of the base.  It turned out that they prevented easy shaking of the table to clear it, which is very useful when debugging.  I replaced the rubber feet with felt pads and found that these were much better.  The feet I ended up using were [these](https://www.amazon.com/Black-Self-Adhesive-Felt-Bumpers/dp/B07DYQJRDB/ref=sr_1_1?sr=8-1).
+* I have added a 3D printed part (not shown) - "Bezel3.stl" - to strengthen the face plate panels (the ones that hold the pots and the UNO face plate).  It contains a channel that the top of the face plate panels seat into and provides some rigidity.  It also helps to protect the wiring of the electronic parts.
+
 
 ----
 
@@ -51,7 +53,7 @@ The Instructable used a single 15mm x 3mm magnet on the end of the linear arm.  
 I had several problems with the gears.  This section contains information regarding my findings and fixes.
 
 ## Dowel Rods
-I couldn't find the tapered dowel rods that were recommended in the Instructable write-up.  I ended up using [1/8" wooden dowel rods](https://www.amazon.com/dp/B0CXDDGRFK) for the geared parts .  This required changing all the dowel rod holes in the geared parts to 2.8mm.  The "Base + Large Gear" files contain the modified parts.
+I couldn't find the tapered dowel rods that were recommended in the Instructable write-up.  I ended up using [1/8" wooden dowel rods](https://www.amazon.com/dp/B0CXDDGRFK) for the geared parts .  This required changing all the dowel rod holes in the geared parts to 3 mm.  The "Modified Parts" files contain the modified parts.  Note that two of the large gear are required.
 
 ## Bearing
 I couldn't find recommended bearing.  Instead I used a [F695-2RS Bearings, 5x13x4mm Ball Bearing](https://www.amazon.com/dp/B0CZ6RBJSZ) which worked out well.
@@ -61,7 +63,7 @@ I accidentally mounted the linear gear in the opposite direction from how the In
 ![Flipped Linear Gear](https://i.imgur.com/Q2l8WMY.jpeg)
 
 ## Large Rotary Gear
-* The Instructable was ambiguous regarding the large rotary gear.  I found that it should be doubled up (i.e. one on top of the other) and in my case I needed the center hole diameter to be 12.7mm.  The included  "Base + Large Gear" files have have been updated with these changes.
+* The Instructable was ambiguous regarding the large rotary gear.  I found that it should be doubled up (i.e. one on top of the other) and in my case I needed the center hole diameter to be 12.7mm.  The included  "Modified Parts" files have have been updated with these changes.  Note that two of the large gear are required.
 * Neither of the laser cut small gears worked well.  Both were a little too wide, probably due to a difference in kerf width between the laser cutter I used and the one used in the Instructable.  I experimented and came up with 3D printed gears to replace both of them.
 * ![Doubled Up Large Gear](https://i.imgur.com/ccbu8Gc.jpeg)
 
@@ -472,7 +474,7 @@ Limited capability to control the sand table remotely via the serial port was ad
  
 # Conclusions
 This has been a great project.  I am very happy with the results.  It gave me a chance to learn more about laser cutting and some useful tools for it.  I would recommend it to anyone with moderate electronics skills.  However, there are a few things I would consider doing differently if I were to make another sand table.
-* The Arduino Uno is somewhat under powered for this project.  It is relatively slow by today's standards, and is very memory limited.  For example, MySandTable.ino uses 90% of the Arduino's memory, and runs a little choppy on some of the more complex shapes.  There are two ways to approach this problem.  First, one could offload shape generation code to another processor which could communicate with the Arduino via its USB port.  The Arduino would then only contain communication and motor driver code.  This is the path taken by [another sand table design I've seen](https://github.com/DIY-Machines/Kinetic-Sand-Art-Table).  This is not a bad approach, but it is more expensive, and requires maintaining 2 separate code bases.  I prefer a second path which would be to use a better processor.  The [Raspberry Pi Pico 2 W](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) would be a great choice due to its low price, great speed, and ample memory.  The problem with this is that at present I could not find a CNC shield that uses the Pico.  I would consider creating one myself since I have some PC board design experience.
+* The Arduino Uno is somewhat under powered for this project.  It is relatively slow by today's standards, and is very memory limited.  For example, MySandTable.ino uses 90% of the Arduino's memory, and runs a little choppy on some of the more complex shapes.  There are two ways to approach this problem.  First, one could offload shape generation code to another processor which could communicate with the Arduino via its USB port.  The Arduino would then only contain communication and motor driver code.  This is the path taken by [another sand table design I've seen](https://github.com/DIY-Machines/Kinetic-Sand-Art-Table).  This is not a bad approach, but it is more expensive, and requires maintaining 2 separate code bases.  I prefer a second path which would be to use a better processor.  The [Adafruit Metro 2350](https://www.adafruit.com/product/6003) is a (mostly) drop in replacement for the Arduino UNO board, but it uses the Raspberry Pi 2350 processor which is almost 10 x as fast and has many times more memory.  This is a great replacement for the UNO, but requires a few firmware changes.  I have completed this update, and will document it in a future project.
 * I might consider making the table a bit bigger.  The size of this table is a bit small, and the motors can certainly handle larger parts.  The limit for me would be the size of work pieces that the laser cutter is capable of.
 * I would consider painting the bottom of the table black in order to make the sand shapes stand out more.  (I'm not sure if this is a good idea or not, but I'd try it anyway).
 * I would update the laser files to add holes that I manually drilled.
