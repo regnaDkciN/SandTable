@@ -44,8 +44,8 @@ The Instructable used a single 15mm x 3mm magnet on the end of the linear arm.  
  ![Front Low Level View](https://i.imgur.com/gy55XrQ.jpeg)
 * I found that the potentiometer face plates were not very secure.  To fix this, I carefully drilled 5/64" holes through the faceplates and base plate and inserted small nails.
 * I originally added rubber feet to the bottom of the base.  It turned out that they prevented easy shaking of the table to clear it, which is very useful when debugging.  I replaced the rubber feet with felt pads and found that these were much better.  The feet I ended up using were [these](https://www.amazon.com/Black-Self-Adhesive-Felt-Bumpers/dp/B07DYQJRDB/ref=sr_1_1?sr=8-1).
-* I have added a 3D printed part (not shown) - "Bezel3.stl" - to strengthen the face plate panels (the ones that hold the pots and the UNO face plate).  It contains a channel that the top of the face plate panels seat into and provides some rigidity.  It also helps to protect the wiring of the electronic parts.
-
+* I have added a 3D printed part - "Bezel3.stl" - to strengthen the face plate panels (the ones that hold the pots and the UNO face plate).  It contains a channel that the top of the face plate panels seat into and provides some rigidity.  It also helps to protect the wiring of the electronic parts.
+![Bezel](https://i.imgur.com/hG6tkcU.jpeg)
 
 ----
 
@@ -145,6 +145,7 @@ I accidentally mounted the linear gear in the opposite direction from how the In
 
 ## MOSFET 
 * Used [Power MOSFET IRFZ44N](https://www.amazon.com/dp/B0CHQ8QJ5K).  Note that the parts list on the Instructable is incorrect and specifies BD139N transistor when IRFZ40N should be used.  IRFZ44N is an acceptable replacement.
+* Added a 100K resistor between the MOSFET gate and ground (source) to keep the LEDs from turning on full brightness at power-up.
 * Used metal 3mm x 8mm bolt to secure MOSFET to left Arduino mounting wing through hole drilled in base.  Also use 2  m3 washers for spacing and heat dissipation.
 ![MOSFET Mount](https://i.imgur.com/AMYUQlH.jpeg)
 

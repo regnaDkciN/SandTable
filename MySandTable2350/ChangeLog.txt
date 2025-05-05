@@ -87,7 +87,13 @@ Arduino UNO to Adafruit Metro 2350 Sand Table Changes
 - SerialLog changes. Removed LOG_U() macro, and replaced all serial logging with
   LOG_F() calls that use printf() style handling.
 - Faceplate USB hole needs to be lowered by 2mm and height reduced to 10mm.
-- Need to change the following back when compiler FP fix is released:
+- Temporarily changed all floats and float operations to doubles to work around a
+  2350 FPU compiler issue #2429:
+     https://github.com/raspberrypi/pico-sdk/pull/2429
+  The issue has been fixed on the development branch, but not added to the release
+  branch yet.  When it is released, this sand table code will restore operation
+  with floats, as double precision is not needed.  Will change the following back
+  when compiler FP fix is released:
     double -> float_t
     cos    -> cosf
     sin    -> sinf
@@ -97,4 +103,27 @@ Arduino UNO to Adafruit Metro 2350 Sand Table Changes
     trunc  -> truncf
     sqrt   -> sqrtf
     pow    -> powf
+- Arduino UNO is a 5V device. 2350 is 3.3V.  Changed the pot voltage from the CNC
+  shield 5V output to its 3.3V output (next to the RST pin).
+- The MOSFET used for the UNO version (IRFZ44N) has a Gate Threshold Voltage
+  (VGS) of 2-4 volts.  This is a little too high for the 3.3V 2350 and did
+  not fully turn on.  Replaced the IRFZ44N with IRLZ44N 
+    https://www.amazon.com/dp/B0CBKH4XGL
+  which has a VGS of 1-2 volts.  This allowed the MOSFET to turn on fully.  
+  Also added a 100K resistor between the gate and source to keep the MOSFET from
+  conducting at power-up.
+- Found a lot of noise on the 2350 analog inputs.  This showd up as LED flicker
+  at lower brightnesses.  To compensate for this, the pot readings (analog inputs)
+  were configured with a resolution of 12 bits, then shifted right by 4 bits after
+  reading.  This effectively produced an 8 bit resolution, which is fine for the
+  sand table application, but eliminated the noise/flicker issue.
+- Also changed the PWM (LED) output frequency to 100,000 to help reduce flicker.
+- Not 2350 related, but added LED update while homing.
+
+2350 picture link:
+    https://cdn-shop.adafruit.com/230x173/6003-10.jpg
+UNO picture link:
+    https://cdn-shop.adafruit.com/230x173/4806-05.jpg
     
+    
+Upgrading from Arduino UNO to Adafruit Metro 2350 (A Case Study)

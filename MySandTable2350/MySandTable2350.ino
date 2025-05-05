@@ -160,7 +160,7 @@ const uint_fast16_t MAX_CIRCLE_LOBES= 10;        // Max circle lobes.
 const uint_fast16_t MIN_SPIRO_FIXEDR= MAX_SCALE_I / 3;
                                                  // Minimum spirograph fixed R size.
 const uint_fast16_t MIN_SPIRO_SMALLR= 8;         // Minimum spirograph moving circle radius.
-const uint_fast32_t SPIRO_NUM_POINTS= 300;       // Number of points to step for
+const uint_fast16_t SPIRO_NUM_POINTS= 300;       // Number of points to step for
                                                  // spirograph shapes.
 const double    SPIRO_ANGLE_BASE= PI_X_2 / (double)SPIRO_NUM_POINTS;
                                                  // Base angle for spirograph shapes.
@@ -2229,7 +2229,7 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
     double offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -2310,7 +2310,7 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
     double offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
@@ -2399,7 +2399,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     double offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast32_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
