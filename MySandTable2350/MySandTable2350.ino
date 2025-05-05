@@ -2710,7 +2710,7 @@ void setup()
         pinMode(i, INPUT_PULLUP);
     }
 
-    // We wet the PWM frequency to 100 khz and set the ADC resolution to 12 bits
+    // We set the PWM frequency to 100 khz and set the ADC resolution to 12 bits
     // (4096) to help reduce LED flicker at low LED knob settings.
     analogWriteFreq(PWM_FREQ);
     analogReadResolution(ANALOG_RESOLUTION);
