@@ -42,6 +42,34 @@ The RP2530 that is used by the Metro has lots of memory compared to the UNO and 
 The UNO program set the timer clock period to 4 microseconds (uSec).  The default RP2350 timer clock period is 1 uSec.  To account for this, all speed delay values were multiplied by 4.  For example ```SPEED_DELAY_MIN_VAL``` was changed from 25 on the UNO to 100 on the RP2350, etc.  Speed increments in  ```HandleRemoteCommands()```  were also adjusted by a factor of 4.
 
 
+### Changed Servos from 8 Microsteps to 64 Microsteps
+With the RP2350's speed and native 32 bit integers, it was possible to improve the servo microstepping from 8 to 64.  This provides smoother and quiter servo movement.  However, this also now requires that the fastest servo moves occur at a 25 microsecond rate.  This is far too fast for the Arduino UNO, but the RP2350 can handle it with no problems.
+
+Both hardware and firmware changes were required for this improvement:
+* Hardware wise, a jumper was added to the M1 pins under each of the TMC2209 driver boards.  This selects 64 step microstepping.  This may be a bit confusing since the Arduino CNC shield and the TMC2209 use different labeling for the microstepping pins.   The pin that the Arduino CNC shield labels M1 actually corresponds to the pin that the TMC2209 refers to as MS2.  In any case, the jumper needs to be placed on the middle microstep pin of the Arduino CNC shield .
+
+	![Microstep Jumper](https://i.imgur.com/FapHoFK.jpeg)
+* Firmware wise,three changes were needed:
+	-  All step related variables and constants needed to change to 32 bit integers since the maximum step count now exceeds the limits of a 16 bit integer.
+	-  All step related constants needed to be multiplied by 8 to account for the 8 times increase in microstepping.	
+	-  All speed related delay constants needed to be further divided by 8 to account for the microstepping change.
+
+```
+const int_fast32_t  ROT_TOTAL_STEPS   = 8 * 16000;  // Rotation axis total steps.
+const int_fast32_t  INOUT_TOTAL_STEPS = 8 * 4300;   // In/Out axis total steps.
+const uint_fast32_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
+...
+volatile int_fast32_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
+int_fast32_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
+volatile int_fast32_t RotSteps     = 0;      // Current # steps rotary is away from 0.
+int_fast32_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
+...
+const int_fast16_t  SPEED_DELAY_MIN_VAL = 100 / 8;   // Minimum axis moving delay value (uSec).
+const int_fast16_t  SPEED_DELAY_MAX_VAL = 2000 / 8;  // Maximum axis speed delay value (uSec).
+
+```
+
+
 ### Different Timer Handling
 The UNO needs the timer clock rate to be set up before use as follows:
 ```
@@ -130,6 +158,27 @@ The rotary servo ISR contains logic to generate compensation pulses in the in/ou
 
   ### GPIO Differences
 The Arduino UNO firmware uses D12 as the enable for the rotation axis.  However, the Metro RP2350 uses D12 for HSTX connectivity.  The pin that used to be occupied by D12 is now D22.  As a result, the RP2350 code was changed to initialize D22 as the rotation axis enable output instead of D12.
+
+### Added Pause Indication
+The Metro RP2350 board contains a red LED that comes in handy in the sand table application to indicate that the axes are pausing, i.e. when the speed knob is turned to its lowest level, or paused via a remote serial command.  This was a simple change and provides some welcome feedback to the user.
+```
+const int PAUSE_LED_PIN      = PIN_LED;     // Pause LED lights red when paused.
+...
+bool UpdateSpeeds()
+{
+     ...
+      // Indicate if we're pausing.
+    digitalWrite(PAUSE_LED_PIN, !keepRunning);
+    ...
+}
+...
+void setup()
+{
+    ...
+    pinMode(PAUSE_LED_PIN, OUTPUT);
+    ...
+}
+```
 
   ### Serial Logging
 The SerialLog.h file provided the ability to selectively log data to the serial port based on the value of user selectable macros.  The major problem with the UNO implementation is that the API did not provide a ```printf()``` function, and the ```sprintf()``` function provided by the UNO API did not handle 64-bit integers or floating point numbers.  As a result, many places in the sand table code resorted to clumsy sequences of log generation.  For example, the following code appears in the UNO version of the ```PlotShapeArray()``` function:

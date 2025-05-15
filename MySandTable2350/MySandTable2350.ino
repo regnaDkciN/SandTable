@@ -19,7 +19,10 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
-// - 27-APR-2025
+// - 12-MAY-2025 JMC
+//   - Added pause indication via red LED.
+//   - Made servo microsteps selectable via MICROSTEPS constant.
+// - 27-APR-2025 JMC
 //   - Original from MySandTable.ino (Arduino UNO version).  Ported to work
 //     with Adafruit Metro 2350 board.  Changes include:
 //       + Using fast data types since 2350 is not tight on memory.
@@ -79,13 +82,17 @@ const int EN_ROT_PIN         = 22;          // Z axis (rotation) enable pin.
 const int STEP_ROT_PIN       = 4;           // Z axis (rotation) step pin.
 const int DIR_ROT_PIN        = 7;           // Z axis (rotation) direction pin.
 const int LIGHTS_PIN         = 11;          // Lights (LEDs) outpuut pin.
+const int PAUSE_LED_PIN      = PIN_LED;     // Pause LED lights red when paused.
 const int BRIGHTNESS_POT_PIN = A0;          // Brightness pot pin.
 const int SPEED_POT_PIN      = A1;          // Speed pot pin.
 const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
 
 // Hardware related constants.
-const int_fast16_t  ROT_TOTAL_STEPS   = 16000;  // Rotation axis total steps.
-const int_fast16_t  INOUT_TOTAL_STEPS = 4300;   // In/Out axis total steps.
+const int_fast32_t  MICROSTEPS        = 63;     // Microsteps used by servos.
+const int_fast32_t  ROT_TOTAL_STEPS   = 2000 * MICROSTEPS;
+                                                // Rotation axis total steps.
+const int_fast32_t  INOUT_TOTAL_STEPS = 537 * MICROSTEPS;
+                                                // In/Out axis total steps.
 const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to inout
                                                 // (small) gear.
 const double       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
@@ -93,12 +100,14 @@ const uint_fast32_t MAX_SCALE_I       = (uint_fast32_t)MAX_SCALE_F;
                                                 // Maximum X or Y coordinate value.
 const double       STEPS_PER_UNIT    = 1.0;    // Higher values produce smoother moves
                                                 // Good values range from 1.0 to 10.0.
-const uint_fast16_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
+const uint_fast32_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
                                                 // The rotational offset to be applied
                                                 // after detecting the rotary home switch
                                                 // while homing.
-const uint_fast16_t MIN_FORCE_DELAY   = 100;    // Minimum servo update delay when forcing.
-const uint_fast16_t MAX_FORCE_DELAY   = 1000;   // Maximum servo update delay when forcing.
+const uint_fast16_t MIN_FORCE_DELAY   = 800 / MICROSTEPS;
+                                                // Minimum servo update delay when forcing.
+const uint_fast16_t MAX_FORCE_DELAY   = 8000 / MICROSTEPS;
+                                                // Maximum servo update delay when forcing.
 const double       WIPE_RATIO        = 9.4;    // This constant should be changed based on
                                                 // ball size.  9.4 is a good value for use
                                                 // with 3mm cylindrical magnet.
@@ -123,7 +132,8 @@ const int_fast16_t  ANALOG_SHIFT_FACTOR = 4;     // Amount to shift analog pot r
 const uint_fast16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
 const uint_fast16_t KNOB_MAX_VAL        = (1 << (ANALOG_RESOLUTION - ANALOG_SHIFT_FACTOR)) - 1;
                                                 // Maximum analog reading for knob.
-const int_fast16_t  SPEED_DELAY_MIN_VAL = 100;   // Minimum axis moving delay value (uSec).
+const int_fast16_t  SPEED_DELAY_MIN_VAL = 800 / MICROSTEPS;
+                                                 // Minimum axis moving delay value (uSec).
                                                  // This macro limits the maximum speed.
                                                  // Original code used 200.  100 is obviously
                                                  // twice as fast, but it is also twice
@@ -131,7 +141,8 @@ const int_fast16_t  SPEED_DELAY_MIN_VAL = 100;   // Minimum axis moving delay va
                                                  // be turned down to reduce noise if
                                                  // desired, or this value could be
                                                  // increased to 200 or 240.
-const int_fast16_t  SPEED_DELAY_MAX_VAL = 2000;  // Maximum axis speed delay value (uSec).
+const int_fast16_t  SPEED_DELAY_MAX_VAL = 16000 / MICROSTEPS;
+                                                 // Maximum axis speed delay value (uSec).
 const int_fast16_t  BRIGHTNESS_MIN_VAL  = 0;     // Minimum LED brightness value .
 const int_fast16_t  BRIGHTNESS_MAX_VAL  = 255;   // Maximum LED brightness value.
 
@@ -209,9 +220,9 @@ volatile double RadAngle = 0.0;      // Current angle of ball from the origin (r
 
 // General runtime variables.
 volatile int_fast32_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
-int_fast16_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
+int_fast32_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
 volatile int_fast32_t RotSteps     = 0;      // Current # steps rotary is away from 0.
-int_fast16_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
+int_fast32_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
 volatile bool         RotOn        = false;  // 'true' if rotary axis is enabled to move.
 volatile bool         InOutOn      = false;  // 'true' if inout axis is enabled to move.
 volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
@@ -280,6 +291,7 @@ struct PlotInfo
     const Coordinate *m_Plot;    // Pointer to a plot array.
     uint_fast16_t     m_Size;    // Size of the array pointed to by m_Plot.
     bool              m_Rotate;  // True to allow rotation.
+    const char       *m_pName;   // Name string.
 }; // End PlotInfo.
 
 
@@ -424,19 +436,28 @@ const Coordinate MazePlot[] =
 // Array of PlotPoints to plot a JMC script text.
 /////////////////////////////////////////////////////////////////////////////////
 const Coordinate JMCPlot[] =
-{   {-100,-8}, {-70,-12}, {-74,-4}, {-74,12}, {-72,16}, {-70,24}, {-66,32},
-    {-62,38}, {-50,36}, {-72,-38}, {-88,-36}, {-90,-32}, {-88,-28}, {-82,-16},
-    {-76,-10}, {-58,-18}, {-24,-22}, {-16,18}, {-18,22}, {-18,30}, {-22,32},
-    {-24,30}, {-28,28}, {-30,26}, {-28,28}, {-24,30}, {-22,32}, {-18,30},
-    {-18,22}, {-16,18}, {-18,14}, {-18,14}, {-16,18}, {-14,24}, {-12,28}, {-8,30},
-    {-4,32}, {-2,28}, {0,26}, {0,22}, {2,18}, {-2,-22}, {2,18}, {4,24}, {6,30},
-    {6,32}, {14,32}, {16,30}, {16,28}, {18,26}, {22,-20}, {26,-22}, {58,-14},
-    {54,-12}, {52,-10}, {52,-6}, {50,-2}, {48,2}, {46,4}, {46,14}, {44,20},
-    {46,24}, {46,30}, {48,34}, {50,36}, {54,38}, {58,40}, {62,36}, {64,32},
-    {68,28}, {64,32}, {62,36}, {58,40}, {54,38}, {50,36}, {48,34}, {46,30},
-    {46,24}, {44,20}, {46,14}, {46,10}, {46,4}, {48,2}, {50,-2}, {52,-6},
-    {54,-12}, {58,-14}, {72,-14}, {74,-12}, {76,-12}, {78,-10}, {80,-10}, {84,-8},
-    {86,-8}, {90,-6}, {100,-8}
+{   {-94, -34}, {-69, -25}, {-61, -25}, {-58, -22}, {-53, -21}, {-58, -8}, {-61, 2},
+    {-62, 16}, {-63, 25}, {-63, 39}, {-62, 53}, {-60, 63}, {-58, 66}, {-56, 68},
+    {-50, 68}, {-49, 65}, {-47, 58}, {-47, -4}, {-48, -15}, {-48, -26}, {-49, -35},
+    {-48, -45}, {-49, -55}, {-50, -63}, {-51, -67}, {-53, -69}, {-59, -69},
+    {-60, -68}, {-62, -63}, {-62, -46}, {-61, -35}, {-59, -28}, {-58, -22},
+    {-54, -21}, {-51, -22}, {-48, -23}, {-46, -24}, {-38, -24}, {-35, -25},
+    {-21, -25}, {-17, -22}, {-17, -8}, {-16, -2}, {-16, 12}, {-15, 19}, {-15, 39},
+    {-14, 46}, {-15, 53}, {-16, 59}, {-17, 66}, {-20, 69}, {-23, 66}, {-25, 62},
+    {-28, 56}, {-25, 62}, {-23, 66}, {-20, 69}, {-17, 66}, {-16, 59}, {-15, 53},
+    {-14, 46}, {-15, 39}, {-15, 19}, {-16, 12}, {-16, -2}, {-17, -8}, {-17, -22},
+    {-17, -8}, {-16, -2}, {-16, 12}, {-15, 19}, {-15, 39}, {-14, 46}, {-13, 56},
+    {-11, 64}, {-7, 69}, {-3, 69}, {-1, 65}, {0, 60}, {1, 55}, {3, 46}, {2, 39},
+    {2, 19}, {1, 12}, {1, -2}, {0, -8}, {0, -22}, {0, -8}, {1, -2}, {1, 12},
+    {2, 19}, {2, 39}, {3, 46}, {4, 57}, {6, 66}, {8, 69}, {10, 71}, {15, 71},
+    {16, 67}, {17, 63}, {18, 58}, {19, 54}, {18, 46}, {18, -12}, {17, -19},
+    {21, -22}, {24, -25}, {40, -25}, {42, -23}, {46, -19}, {44, -14}, {43, -11},
+    {42, -5}, {41, 2}, {41, 23}, {42, 32}, {42, 40}, {44, 48}, {46, 56}, {49, 62},
+    {52, 66}, {56, 68}, {59, 67}, {61, 60}, {63, 51}, {64, 42}, {63, 51}, {61, 60},
+    {59, 67}, {56, 68}, {52, 66}, {49, 62}, {46, 56}, {44, 48}, {42, 40}, {42, 32},
+    {41, 23}, {41, 2}, {42, -5}, {44, -14}, {46, -19}, {49, -23}, {53, -25},
+    {71, -25}, {96, -34}
+
 }; // End JMCPlot.
 
 
@@ -1208,7 +1229,7 @@ bool UpdateSpeeds()
         SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
         // Check against a value slightly higher than 0 due to ADC inaccuracies.
-        keepRunning = (speedKnobVal >= KNOB_MIN_VAL + 5);
+        keepRunning = (speedKnobVal >= KNOB_MIN_VAL + 16);
     }
 
     // Set the values atomically.
@@ -1216,7 +1237,10 @@ bool UpdateSpeeds()
     RotDelay   = SpeedDelay * RotSpeedFactor;
     InOutDelay = SpeedDelay * InOutSpeedFactor;
     interrupts();
-
+    
+    // Indicate if we're pausing.
+    digitalWrite(PAUSE_LED_PIN, !keepRunning);
+    
     // Return an indication of whether or not motors should run.
     return keepRunning;
 } // End UpdateSpeeds().
@@ -1945,8 +1969,8 @@ void RandomRatiosRing()
 /////////////////////////////////////////////////////////////////////////////////
 const PlotInfo Plots[] =
 {
-    {JMCPlot,  sizeof(JMCPlot)  / sizeof(JMCPlot[0]),  false},
-    {MazePlot, sizeof(MazePlot) / sizeof(MazePlot[0]), true}
+    {JMCPlot,  sizeof(JMCPlot)  / sizeof(JMCPlot[0]),  false, "JMCPlot"},
+    {MazePlot, sizeof(MazePlot) / sizeof(MazePlot[0]), true,  "MazePlot"}
 }; // End Plots[].
 
 
@@ -1959,11 +1983,13 @@ const PlotInfo Plots[] =
 //   - shape  : A pointer to the array of Coordinate structs for the shape.
 //   - size   : The size of the array (= # Coordinate instances).
 //   - rotate : Set 'true' to allow rotation.  'false' otherwise.
+//   - pName  : Name string of the array to plot.
 /////////////////////////////////////////////////////////////////////////////////
-void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate)
+void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate,
+                    const char *pName)
 {
     // Show our call.
-    LOG_F(LOG_INFO, "PlotShapeArray(0x%x,%d,%d)\n", (int)shape, size, rotate);
+    LOG_F(LOG_INFO, "PlotShapeArray(%s,%d,%d)\n", pName, size, rotate);
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.
@@ -2028,7 +2054,8 @@ void RandomPlot()
 {
     // Select a random one and execute it.
     size_t index = random(0, sizeof(Plots) / sizeof(Plots[0]));
-    PlotShapeArray(Plots[index].m_Plot, Plots[index].m_Size, Plots[index].m_Rotate);
+    PlotShapeArray(Plots[index].m_Plot, Plots[index].m_Size, Plots[index].m_Rotate,
+                   Plots[index].m_pName);
 } // End RandomPlot().
 
 
@@ -2724,6 +2751,7 @@ void setup()
     pinMode(STEP_INOUT_PIN, OUTPUT);
     pinMode(DIR_INOUT_PIN, OUTPUT);
     pinMode(EN_INOUT_PIN, OUTPUT);
+    pinMode(PAUSE_LED_PIN, OUTPUT);
     pinMode(BRIGHTNESS_POT_PIN, INPUT);
     pinMode(SPEED_POT_PIN, INPUT);
     // Initialize the home input pin as input with pullup.
@@ -2795,7 +2823,8 @@ void loop()
         RotateToAngle(atan2((double)JMCPlot[0].y, (double)JMCPlot[0].x));
 
         // Show JMC...
-        PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false);
+        PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false,
+                       "JMCPlot");
 
         // Delay a while to let the user view your awesome work!
         delay(5000);
