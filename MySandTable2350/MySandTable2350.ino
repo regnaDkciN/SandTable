@@ -19,6 +19,8 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 18-MAY-2025 JMC
+//   - Added use of PIO state machines (STStepper) to step the servos.
 // - 12-MAY-2025 JMC
 //   - Added pause indication via red LED.
 //   - Made servo microsteps selectable via MICROSTEPS constant.
@@ -46,8 +48,9 @@
 //
 // Copyright (c) 2025, Joseph M. Corbett
 /////////////////////////////////////////////////////////////////////////////////
-#include <limits.h>     // For UINT_MAX.
+#include <limits.h>         // For UINT_MAX.
 #include "SerialLog2350.h"  // For data logging macro (LOG_F).
+#include "STStepper.pio.h"  // For STStepper class and stepper PIO state machine.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -88,7 +91,7 @@ const int SPEED_POT_PIN      = A1;          // Speed pot pin.
 const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
 
 // Hardware related constants.
-const int_fast32_t  MICROSTEPS        = 63;     // Microsteps used by servos.
+const int_fast32_t  MICROSTEPS        = 64;     // Microsteps used by servos.
 const int_fast32_t  ROT_TOTAL_STEPS   = 2000 * MICROSTEPS;
                                                 // Rotation axis total steps.
 const int_fast32_t  INOUT_TOTAL_STEPS = 537 * MICROSTEPS;
@@ -104,9 +107,20 @@ const uint_fast32_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
                                                 // The rotational offset to be applied
                                                 // after detecting the rotary home switch
                                                 // while homing.
-const uint_fast16_t MIN_FORCE_DELAY   = 800 / MICROSTEPS;
+const int_fast16_t  SPEED_DELAY_MIN_VAL = 1600 / MICROSTEPS;
+                                                 // Minimum axis moving delay value (uSec).
+                                                 // This macro limits the maximum speed.
+                                                 // Original code used 200.  100 is obviously
+                                                 // twice as fast, but it is also twice
+                                                 // as noisy.  The speed knob can always
+                                                 // be turned down to reduce noise if
+                                                 // desired, or this value could be
+                                                 // increased to 200 or 240.
+const int_fast16_t  SPEED_DELAY_MAX_VAL = 32000 / MICROSTEPS;
+                                                 // Maximum axis speed delay value (uSec).
+const uint_fast16_t MIN_FORCE_DELAY   = SPEED_DELAY_MIN_VAL;
                                                 // Minimum servo update delay when forcing.
-const uint_fast16_t MAX_FORCE_DELAY   = 8000 / MICROSTEPS;
+const uint_fast16_t MAX_FORCE_DELAY   = SPEED_DELAY_MAX_VAL;
                                                 // Maximum servo update delay when forcing.
 const double       WIPE_RATIO        = 9.4;    // This constant should be changed based on
                                                 // ball size.  9.4 is a good value for use
@@ -132,17 +146,6 @@ const int_fast16_t  ANALOG_SHIFT_FACTOR = 4;     // Amount to shift analog pot r
 const uint_fast16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
 const uint_fast16_t KNOB_MAX_VAL        = (1 << (ANALOG_RESOLUTION - ANALOG_SHIFT_FACTOR)) - 1;
                                                 // Maximum analog reading for knob.
-const int_fast16_t  SPEED_DELAY_MIN_VAL = 800 / MICROSTEPS;
-                                                 // Minimum axis moving delay value (uSec).
-                                                 // This macro limits the maximum speed.
-                                                 // Original code used 200.  100 is obviously
-                                                 // twice as fast, but it is also twice
-                                                 // as noisy.  The speed knob can always
-                                                 // be turned down to reduce noise if
-                                                 // desired, or this value could be
-                                                 // increased to 200 or 240.
-const int_fast16_t  SPEED_DELAY_MAX_VAL = 16000 / MICROSTEPS;
-                                                 // Maximum axis speed delay value (uSec).
 const int_fast16_t  BRIGHTNESS_MIN_VAL  = 0;     // Minimum LED brightness value .
 const int_fast16_t  BRIGHTNESS_MAX_VAL  = 255;   // Maximum LED brightness value.
 
@@ -247,6 +250,11 @@ bool                  RemotePause  = false;  // 'true' if pausing motionremotely
 bool                  AbortShape   = false;  // 'true' if aborting ghe current shape.
 uint_fast16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
 bool                  RandomSeedChanged = false;  // 'true' when random seed has been change.
+
+// Create our stepper state machines.
+const float STEPPER_FREQUENCY = 1000000.0;  // Frequency for stepper state machines.
+STStepper RotStepper(  DIR_ROT_PIN,   STEP_ROT_PIN,   STEPPER_FREQUENCY);
+STStepper InOutStepper(DIR_INOUT_PIN, STEP_INOUT_PIN, STEPPER_FREQUENCY);
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -753,7 +761,7 @@ void CalculateXY()
 //                 Higher values produce slower speeds.  Good values range from
 //                 100 to 1000.
 /////////////////////////////////////////////////////////////////////////////////
-void ForceInOut(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
+void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 {
     // Limit our arguments.
     steps = min(steps, INOUT_TOTAL_STEPS + 10);
@@ -764,14 +772,11 @@ void ForceInOut(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Set the in/out direction.
     DirInOut = direction;
-    digitalWrite(DIR_INOUT_PIN, DirInOut);
 
     // Move the in/out axis as specified.
-    for (int_fast16_t x = 0; x < steps; x++)
+    for (int_fast32_t x = 0; x < steps; x++)
     {
-        digitalWrite(STEP_INOUT_PIN, HIGH);
-        delayMicroseconds(delay);
-        digitalWrite(STEP_INOUT_PIN, LOW);
+        InOutStepper.Step(DirInOut);
         delayMicroseconds(delay);
         UpdateLeds();
     }
@@ -793,7 +798,7 @@ void ForceInOut(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
 //                 Higher values produce slower speeds.  Good values range from
 //                 100 to 1000.
 /////////////////////////////////////////////////////////////////////////////////
-void ForceRot(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
+void ForceRot(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 {
     // Limit our arguments.
     delay = constrain(delay, MIN_FORCE_DELAY, MAX_FORCE_DELAY);
@@ -803,14 +808,11 @@ void ForceRot(int_fast16_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Set direction.
     DirRot = direction;
-    digitalWrite(DIR_ROT_PIN, DirRot);
 
     // Move the rotation axis as specified.
-    for (int_fast16_t x = 0; x < steps; x++)
+    for (int_fast32_t x = 0; x < steps; x++)
     {
-        digitalWrite(STEP_ROT_PIN, HIGH);
-        delayMicroseconds(delay);
-        digitalWrite(STEP_ROT_PIN, LOW);
+        RotStepper.Step(DirRot);
         delayMicroseconds(delay);
         UpdateLeds();
     }
@@ -852,26 +854,26 @@ void Home()
         DirRot = CCW;
         while (IsRotHome())
         {
-             ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
+             ForceRot(1, DirRot, MAX_FORCE_DELAY);
         }
 
         // Rotate CW until the rotary home switch is detected.
         DirRot = CW;
         while (!IsRotHome())
         {
-             ForceRot(1, DirRot, MAX_FORCE_DELAY / 2);
+             ForceRot(1, DirRot, MAX_FORCE_DELAY / 4);
         }
 
         // Disable inout to eliminate clicking on CW move.
         DisableInOut();
         // Apply the homing rotational offset (if any).
         DirRot = CCW;
-        ForceRot(HOME_ROT_OFFSET, DirRot, MIN_FORCE_DELAY * 2);
+        ForceRot(HOME_ROT_OFFSET, DirRot, MIN_FORCE_DELAY * 3);
     } // End USE_HOME_SENSOR.
 
     // Retract the inout axis all the way (to zero).
     DirInOut = IN;
-    ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY * 2);
+    ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY * 3);
 
     // We are now at position (0, 0).  Update our position related variables.
     CurrentX     = 0.0;
@@ -943,8 +945,6 @@ void ReverseKinematics(double newX, double newY)
         {
             DirInOut = OUT;  // Go out.
         }
-        // Set the in/out direction.
-        digitalWrite(DIR_INOUT_PIN, DirInOut);
     }
 
     // Determine whether to go CW or CCW.
@@ -961,8 +961,6 @@ void ReverseKinematics(double newX, double newY)
         {
             DirRot = CW;
         }
-        // Set the rotary direction.
-        digitalWrite(DIR_ROT_PIN, DirRot);
     }
 
     // Start the move atomically.
@@ -1025,7 +1023,6 @@ void RotateToAngle(double angle)
     {
         // Set the direction and start the move.
         DirRot = (RotStepsTo > RotSteps) ? CW : CCW;
-        digitalWrite(DIR_ROT_PIN, DirRot);
         RotOn = true;
 
         // Wait for the move to complete.
@@ -1237,10 +1234,10 @@ bool UpdateSpeeds()
     RotDelay   = SpeedDelay * RotSpeedFactor;
     InOutDelay = SpeedDelay * InOutSpeedFactor;
     interrupts();
-    
+
     // Indicate if we're pausing.
     digitalWrite(PAUSE_LED_PIN, !keepRunning);
-    
+
     // Return an indication of whether or not motors should run.
     return keepRunning;
 } // End UpdateSpeeds().
@@ -1871,7 +1868,6 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
         DirInOut = OUT;
         DirRot = ROT_CAUSING_IN;
     }
-    digitalWrite(DIR_ROT_PIN, DirRot);
 
     // Start the move by turning the motors on atomically.
     noInterrupts();
@@ -2729,12 +2725,15 @@ void ResetShapes()
 /////////////////////////////////////////////////////////////////////////////////
 void setup()
 {
-    // Initially set all I/O pins as inputs with pullup per MicroChip recommendation
-    // to avoid floating inputs.
+    // Initially set all I/O pins except those used by the PIO state machines as
+    // inputs with pullup per MicroChip recommendation to avoid floating inputs.
     for(int i = 0; i < 23; i++)
     {
-        // D0 to D13; D14 (A0) to D19 (A5) are inputs but not floating.
-        pinMode(i, INPUT_PULLUP);
+        if ((i != STEP_ROT_PIN) && (i != DIR_ROT_PIN) &&
+            (i != STEP_INOUT_PIN) && (i != DIR_INOUT_PIN))
+        {
+            pinMode(i, INPUT_PULLUP);
+        }
     }
 
     // We set the PWM frequency to 100 khz and set the ADC resolution to 12 bits
@@ -2745,11 +2744,7 @@ void setup()
     // Define GPIO pins per our hardware setup.
     pinMode(LIGHTS_PIN, OUTPUT);
     analogWrite(LIGHTS_PIN, BRIGHTNESS_MIN_VAL);
-    pinMode(STEP_ROT_PIN, OUTPUT);
-    pinMode(DIR_ROT_PIN, OUTPUT);
     pinMode(EN_ROT_PIN, OUTPUT);
-    pinMode(STEP_INOUT_PIN, OUTPUT);
-    pinMode(DIR_INOUT_PIN, OUTPUT);
     pinMode(EN_INOUT_PIN, OUTPUT);
     pinMode(PAUSE_LED_PIN, OUTPUT);
     pinMode(BRIGHTNESS_POT_PIN, INPUT);
@@ -2862,9 +2857,6 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    // Used to toggle the motor's step pin.
-    static bool pwm = false;
-
     // inOutCompAccum - accumulates in/out error based on rotary movement.  For
     // every GEAR_RATIO number of rotary steps, in/out moves 1 step in a direction
     // depending on the mechanical setup.  inOutCompAccum accumulates the error,
@@ -2874,95 +2866,66 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
     {
-        // Pulse the step pin to generate a step.  The motor steps on each low to
-        // high transition of the step pin.
-        pwm = !pwm;
-        digitalWrite(STEP_ROT_PIN, pwm);
+        // Step the rotary servo in the proper direction.
+        RotStepper.Step(DirRot);
 
-        // The motor only actually steps on every other execution of the ISR (on
-        // each low to high transition of the step pin).
-        if (!pwm)
+        // Keep track of (accumulate) the number of rotational steps based
+        // direction of rotation.
+        int_fast16_t offsetDir = (DirRot == ROT_CAUSING_IN) ? 1 : -1;
+        inOutCompAccum += offsetDir;
+        RotSteps += offsetDir;
+
+        // Rotations cause in/out mechanical movement.  When the limit is
+        // reached, we compensate by adding a step in the proper in/out
+        // direction.
+        if (abs(inOutCompAccum) >= GEAR_RATIO)
         {
-            // Keep track of (accumulate) the number of rotational steps based
-            // direction of rotation.
-            int_fast16_t offsetDir = (DirRot == ROT_CAUSING_IN) ? 1 : -1;
-            inOutCompAccum += offsetDir;
-            RotSteps += offsetDir;
-
-            // Rotations cause in/out mechanical movement.  When the limit is
-            // reached, we compensate by adding a step in the proper in/out
-            // direction.
-            if (abs(inOutCompAccum) >= GEAR_RATIO)
+            // Reset our compensation accumulator.
+            inOutCompAccum = 0;
+            if (InOutOn)
             {
-                // Reset our compensation accumulator.
-                inOutCompAccum = 0;
-                if (InOutOn)
-                {
-                    // The in/out motor is already moving.  Simply update the
-                    // InOutSteps counter to account for our compensation.
-                    InOutSteps -= offsetDir;
-                }
-                else
-                {
-                    // The in/out motor is not moving.  Force our compensation
-                    // by actually stepping the in/out motor in the correct
-                    // direction.  Setup our in/out compensation direction.
-                    digitalWrite(DIR_INOUT_PIN, (DirRot == CW) ? IN : OUT);
-
-                    // We need to be careful when steppint the in/out motor.
-                    // It's last step pin state may be either HIGH or LOW.
-                    // We add a step here by making sure to toggle the step pin
-                    // from LOW to HIGH, and make sure that we leave the pin
-                    // in it's original state.
-                    if (digitalRead(STEP_INOUT_PIN))
-                    {
-                        // In/out step pin was already HIGH.  Set it LOW then
-                        // HIGH again.  Add a short delay between changes just
-                        // to be safe.
-                        digitalWrite(STEP_INOUT_PIN, LOW);
-                        delayMicroseconds(5);
-                        digitalWrite(STEP_INOUT_PIN, HIGH);
-                    }
-                    else
-                    {
-                        // In/out step wil was already LOW.  Set it HIGH, then
-                        // return it to its original LOW state.
-                        digitalWrite(STEP_INOUT_PIN, HIGH);
-                        delayMicroseconds(5);
-                        digitalWrite(STEP_INOUT_PIN, LOW);
-                    }
-                }
+                // The in/out motor is already moving.  Simply update the
+                // InOutSteps counter to account for our compensation.
+                InOutSteps -= offsetDir;
             }
-
-            // Wrap-around conditions for rotational steps.
-            if (RotSteps > ROT_TOTAL_STEPS)
+            else
             {
-                RotSteps = 0;
+                // The in/out motor is not moving.  Force our compensation
+                // by actually stepping the in/out motor in the correct
+                // direction.
+                DirInOut = (DirRot == CW) ? IN : OUT;
+                InOutStepper.Step(DirInOut);
             }
-            else if (RotSteps < 0)
-            {
-                RotSteps = ROT_TOTAL_STEPS - 1;
-            }
+        }
 
-            // Update our (possibly new) rotational angle which is used in background
-            // processing.
-            RadAngle = ((double)RotSteps * PI_X_2) / (double)ROT_TOTAL_STEPS;
+        // Wrap-around conditions for rotational steps.
+        if (RotSteps > ROT_TOTAL_STEPS)
+        {
+            RotSteps = 0;
+        }
+        else if (RotSteps < 0)
+        {
+            RotSteps = ROT_TOTAL_STEPS - 1;
+        }
 
-            // Complete the move if we've reached our target and are not using
-            // multiple points.
-            if (MRPointCount == 0)
+        // Update our (possibly new) rotational angle which is used in background
+        // processing.
+        RadAngle = ((double)RotSteps * PI_X_2) / (double)ROT_TOTAL_STEPS;
+
+        // Complete the move if we've reached our target and are not using
+        // multiple points.
+        if (MRPointCount == 0)
+        {
+            if (RotSteps == RotStepsTo)
             {
-                if (RotSteps == RotStepsTo)
-                {
-                    // Turn off the motor if it reaches the set point.
-                    RotOn = false;
-                }
-                if (InOutSteps == InOutStepsTo)
-                {
-                    InOutOn = false;
-                }
+                // Turn off the motor if it reaches the set point.
+                RotOn = false;
             }
-        } // End  if (!pwm)
+            if (InOutSteps == InOutStepsTo)
+            {
+                InOutOn = false;
+            }
+        }
     } // End if (RotOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
@@ -2979,9 +2942,6 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    // Used to toggle the motor's step pin.
-    static bool pwm = false;
-
     // Used to remember the last iteratioins in/out direction.
     static uint_fast8_t lastInOutDir = DirInOut;
 
@@ -2991,71 +2951,62 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
     {
-        // Set the direction, and pulse the step pin to generate a step.
-        digitalWrite(DIR_INOUT_PIN, DirInOut);
-        pwm = !pwm;
-        digitalWrite(STEP_INOUT_PIN, pwm);
+        // Step the in/out servo in the proper direction.
+        InOutStepper.Step(DirInOut);
 
-        // The motor only actually steps on every other execution of the ISR (on
-        // each low to high transition of the step pin).
-        if (!pwm)
+        // Update in/out steps based on the direction.
+        if (DirInOut == OUT)
         {
-            // Update in/out steps based on the direction.
-            if (DirInOut == OUT)
+            InOutSteps++;
+        }
+        else
+        {
+            InOutSteps--;
+        }
+
+        // Handle normal case of not using multiple points first.
+        if (MRPointCount == 0)
+        {
+            // Complete the move if we've reached our target and are not
+            // using multiple points.
+            if (InOutSteps == InOutStepsTo)
             {
-                InOutSteps++;
+                InOutOn = false;
             }
-            else
+            lastMRPoints = false;
+        }
+        else  // MRPointCount != 0.
+        {
+            // First time using multiple points - remember our initial in/out
+            // direction.
+            if (!lastMRPoints)
             {
-                InOutSteps--;
+                lastInOutDir = DirInOut;
+                lastMRPoints = true;
+            }
+            // Adjust the direction if limits are reached.
+            if (InOutSteps > OutLimit)
+            {
+                DirInOut = IN;
+            }
+            else if (InOutSteps < InLimit)
+            {
+                DirInOut = OUT;
             }
 
-            // Handle normal case of not using multiple points first.
-            if (MRPointCount == 0)
+            // If we're creating multiple points and the direction has changed,
+            // deccrement the points count.
+            if (lastInOutDir != DirInOut)
             {
-                // Complete the move if we've reached our target and are not
-                // using multiple points.
-                if (InOutSteps == InOutStepsTo)
+                if (--MRPointCount == 0)
                 {
+                    RotOn   = false;
                     InOutOn = false;
                 }
-                lastMRPoints = false;
+                // Remember the current in/out direction for next time.
+                lastInOutDir = DirInOut;
             }
-            else  // MRPointCount != 0.
-            {
-                // First time using multiple points - remember our initial in/out
-                // direction.
-                if (!lastMRPoints)
-                {
-                    lastInOutDir = DirInOut;
-                    lastMRPoints = true;
-                }
-                // Adjust the direction if limits are reached.
-                if (InOutSteps > OutLimit)
-                {
-                    DirInOut = IN;
-                }
-                else if (InOutSteps < InLimit)
-                {
-                    DirInOut = OUT;
-                }
-                // Set the (possibly new) direction.
-                digitalWrite(DIR_INOUT_PIN, DirInOut);
-
-                // If we're creating multiple points and the direction has changed,
-                // deccrement the points count.
-                if (lastInOutDir != DirInOut)
-                {
-                    if (--MRPointCount == 0)
-                    {
-                        RotOn   = false;
-                        InOutOn = false;
-                    }
-                    // Remember the current in/out direction for next time.
-                    lastInOutDir = DirInOut;
-                }
-            } // End else (MRPointCount)
-        } // End if (!pwm)
+        } // End else (MRPointCount)
     } // End if (InOutOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
