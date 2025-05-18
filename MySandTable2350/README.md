@@ -154,7 +154,19 @@ The latest UNO implementation of the sand table used an open analog input and a 
 The Arduino UNO API supplies a ```squaref()``` function to square a float value.  This function is replaced in the RP2350 API with a function named ```sq()``` that does the same thing. So uses of ```squaref()``` were changed to ```sq()```.
 
   ### Execution Speed Differences
-The rotary servo ISR contains logic to generate compensation pulses in the in/out servo proportional to the rotary axis movement.  Part of this logic uses a short delay to affect a pulse on the in/out servo.  In the UNO, a pulse delay of 1 microsecond was used.  Due to the slow speed of the UNO processor, this delay plus the surrounding code was sufficient to generate a pulse long enough for the servo driver hardware to handle.  However, since the RP2350 is so much faster, it was feared that the generated pulse might be too short, so the pulse delay was changed to 5 microseconds.  This was probably not necessary, but was done just in case.  I am currently considering using the RP2350 PIO state machines to generate the pulses to control the servo drivers.  If this is implemented, the hard wired delays will be unnecessary and will be removed from the ISR code.
+The rotary servo ISR contains logic to generate compensation pulses in the in/out servo proportional to the rotary axis movement.  Part of this logic uses a short delay to affect a pulse on the in/out servo.  In the UNO, a pulse delay of 1 microsecond was used.  Due to the slow speed of the UNO processor, this delay plus the surrounding code was sufficient to generate a pulse long enough for the servo driver hardware to handle.  However, since the RP2350 is so much faster, it was feared that the generated pulse might be too short, so the pulse delay was changed to 5 microseconds.  This was probably not necessary, but was done just in case
+
+**UPDATE:** The latest version of the sand table firmware uses the the PIO state machines of the RP2350 processor to generate servo step pulses.  New file - STStepper.pio and STStepper.pio.h - implement the servo stepping logic.  Each step now uses the state machine to do the following for each step:
+1. Set the servo's direction.
+2. Delay 1 uSec.
+3. Toggle the step pin high.
+4. Delay 6 uSec.
+5. Toggle the step pin low.
+6. Delay 6 uSec.
+
+As a result of using the PIO state machines, the servo ISR's were modified to step on each call rather than on every other call.  This allows the ISR to be called half as often as before, which leaves more execution time for other things.
+
+The Arduino IDE does not directly handle compiling the STStepper.pio file to the STStepper.pio.h file.  In order to generate the STStepper.pio.h file from the STStepper.pio file, the STStepper.pio file was added to a Visual Studio Code project, it was compiled, then the generated STStepper.pio.h file was copied to the MySandTable2350 directory.
 
   ### GPIO Differences
 The Arduino UNO firmware uses D12 as the enable for the rotation axis.  However, the Metro RP2350 uses D12 for HSTX connectivity.  The pin that used to be occupied by D12 is now D22.  As a result, the RP2350 code was changed to initialize D22 as the rotation axis enable output instead of D12.
