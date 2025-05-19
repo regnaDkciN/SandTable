@@ -43,7 +43,7 @@ The UNO program set the timer clock period to 4 microseconds (uSec).  The defaul
 
 
 ### Changed Servos from 8 Microsteps to 64 Microsteps
-With the RP2350's speed and native 32 bit integers, it was possible to improve the servo microstepping from 8 to 64.  This provides smoother and quiter servo movement.  However, this also now requires that the fastest servo moves occur at a 25 microsecond rate.  This is far too fast for the Arduino UNO, but the RP2350 can handle it with no problems.
+With the RP2350's speed and native 32 bit integers, it was possible to improve the servo microstepping from 8 to 64.  This provides smoother and quieter servo movement.  However, this also now requires that the fastest servo moves occur at a 25 microsecond rate.  This is far too fast for the Arduino UNO, but the RP2350 can handle it with no problems.
 
 Both hardware and firmware changes were required for this improvement:
 * Hardware wise, a jumper was added to the M1 pins under each of the TMC2209 driver boards.  This selects 64 step microstepping.  This may be a bit confusing since the Arduino CNC shield and the TMC2209 use different labeling for the microstepping pins.   The pin that the Arduino CNC shield labels M1 actually corresponds to the pin that the TMC2209 refers to as MS2.  In any case, the jumper needs to be placed on the middle microstep pin of the Arduino CNC shield .

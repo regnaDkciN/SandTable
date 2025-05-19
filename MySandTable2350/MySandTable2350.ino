@@ -19,6 +19,10 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 19-MAY-2025 JMC
+//   - Adjusted some delay values.
+//   - Fixed RotateToAngle() to rotate in closest direction.
+//   - Fixed pause LED to light when remotely paused too.
 // - 18-MAY-2025 JMC
 //   - Added use of PIO state machines (STStepper) to step the servos.
 // - 12-MAY-2025 JMC
@@ -529,12 +533,12 @@ void HandleRemoteCommands()
         {
             // Increase speed.
             case 'F':
-                SpeedDelay -= 80;
+                SpeedDelay -= 40;
                 RemoteSpeedDelay = true;
             break;
             // Decrease speed.
             case 'S':
-                SpeedDelay += 80;
+                SpeedDelay += 40;
                 RemoteSpeedDelay = true;
             break;
             // Restore local control of speed;
@@ -543,12 +547,12 @@ void HandleRemoteCommands()
             break;
             // Increase brightness.
             case 'B':
-                Brightness += 5;
+                Brightness += 2;
                 RemoteBrightness = true;
             break;
             // Decrease brightness.
             case 'D':
-                Brightness -= 5;
+                Brightness -= 2;
                 RemoteBrightness = true;
             break;
             // Restore local control of brightness.
@@ -1012,7 +1016,7 @@ void RotateToAngle(double angle)
     angle += (angle < 0.0) ? PI_X_2 : 0.0;
 
     // Calculate the rotation steps and limit as needed.
-    RotStepsTo = (int_fast16_t)((angle * (double)ROT_TOTAL_STEPS) / PI_X_2);
+    RotStepsTo = (int_fast16_t)round(((angle * (double)ROT_TOTAL_STEPS) / PI_X_2));
     if (RotStepsTo >= ROT_TOTAL_STEPS)
     {
         RotStepsTo -= ROT_TOTAL_STEPS;
@@ -1022,7 +1026,10 @@ void RotateToAngle(double angle)
     if (RotStepsTo != RotSteps)
     {
         // Set the direction and start the move.
-        DirRot = (RotStepsTo > RotSteps) ? CW : CCW;
+        DirRot = (((RotStepsTo > RotSteps) &&
+                   (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
+                  ((RotStepsTo < RotSteps) && (RotSteps - RotStepsTo > ROT_TOTAL_STEPS / 2)))
+                   ? CCW : CW;
         RotOn = true;
 
         // Wait for the move to complete.
@@ -1190,7 +1197,6 @@ inline uint_fast16_t ReadAPot(int pot)
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateLeds()
 {
-
     // Only read left BRIGHTNESS pot if we're not being controlled remotely.
     if (!RemoteBrightness)
     {
@@ -1236,7 +1242,7 @@ bool UpdateSpeeds()
     interrupts();
 
     // Indicate if we're pausing.
-    digitalWrite(PAUSE_LED_PIN, !keepRunning);
+    digitalWrite(PAUSE_LED_PIN, !keepRunning || RemotePause);
 
     // Return an indication of whether or not motors should run.
     return keepRunning;
@@ -1354,7 +1360,7 @@ void EndShape()
     uint_fast32_t startTime = millis();
     while (millis() - startTime < END_PLOT_DELAY)
     {
-        delay(100);
+        delayMicroseconds(50);
         ReadPots();
     }
 } // End EndShape().
@@ -2820,9 +2826,7 @@ void loop()
         // Show JMC...
         PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false,
                        "JMCPlot");
-
-        // Delay a while to let the user view your awesome work!
-        delay(5000);
+        EndShape();
         firstTime = false;
     }
 

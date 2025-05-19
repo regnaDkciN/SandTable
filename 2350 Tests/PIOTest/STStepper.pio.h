@@ -12,23 +12,22 @@
 // ststepper //
 // --------- //
 
-#define ststepper_wrap_target 1
-#define ststepper_wrap 3
+#define ststepper_wrap_target 0
+#define ststepper_wrap 2
 #define ststepper_pio_version 0
 
 static const uint16_t ststepper_program_instructions[] = {
-    0xa042, //  0: nop                    side 0
             //     .wrap_target
+    0xa542, //  0: nop                    side 0 [5]
     0x6001, //  1: out    pins, 1         side 0
     0xb542, //  2: nop                    side 1 [5]
-    0xa542, //  3: nop                    side 0 [5]
             //     .wrap
 };
 
 #if !PICO_NO_HARDWARE
 static const struct pio_program ststepper_program = {
     .instructions = ststepper_program_instructions,
-    .length = 4,
+    .length = 3,
     .origin = -1,
     .pio_version = ststepper_pio_version,
 #if PICO_PIO_VERSION > 0
