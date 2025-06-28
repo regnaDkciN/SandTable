@@ -56,7 +56,6 @@
 #include "SerialLog2350.h"  // For data logging macro (LOG_F).
 #include "STStepper.pio.h"  // For STStepper class and stepper PIO state machine.
 
-
 /////////////////////////////////////////////////////////////////////////////////
 // S E R I A L   L O G   S E T T I N G S
 //
@@ -107,7 +106,7 @@ const uint_fast32_t MAX_SCALE_I       = (uint_fast32_t)MAX_SCALE_F;
                                                 // Maximum X or Y coordinate value.
 const double       STEPS_PER_UNIT    = 1.0;    // Higher values produce smoother moves
                                                 // Good values range from 1.0 to 10.0.
-const uint_fast32_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
+const uint_fast32_t HOME_ROT_OFFSET   = 353 * (ROT_TOTAL_STEPS / 1000);
                                                 // The rotational offset to be applied
                                                 // after detecting the rotary home switch
                                                 // while homing.
@@ -472,7 +471,8 @@ const Coordinate JMCPlot[] =
 
 }; // End JMCPlot.
 
-
+char logbuf[100][50];
+uint_fast16_t logbufcount = 0;
 /////////////////////////////////////////////////////////////////////////////////
 // S U P P O R T   F U N C T I O N S
 /////////////////////////////////////////////////////////////////////////////////
@@ -520,15 +520,25 @@ void HandleRemoteCommands()
     if (Serial.available() > 0)
     {
         // Setup a buffer to hold any received commands.
-        const uint_fast16_t BUFLEN = 40;
+        const uint_fast16_t BUFLEN = 80;
+        const char *HELLO_STRING = "Hello Sand Table!";
         char buf[BUFLEN];
-        uint_fast16_t len = 0;
 
         // Got a message.  Update our timeout base.
         lastMessageMs = millis();
 
         // Handle the remote command.
-        buf[0] = Serial.read();
+        int_fast16_t numBytesRead = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
+        // Remove any trailing junk from the input buffer.
+        do
+        {
+            buf[numBytesRead--] = '\0';
+        } while (isspace(buf[numBytesRead]) && (numBytesRead >= 0));
+if (logbufcount < 100)        
+{
+        strncpy(logbuf[logbufcount++], buf, 50);
+} 
+LOG_F(LOG_ALWAYS, "%s....\n", buf);       
         switch (toupper(buf[0]))
         {
             // Increase speed.
@@ -570,10 +580,8 @@ void HandleRemoteCommands()
             // Start with a new random seed.
             case 'R':
                 // Read the new seed value.
-                len = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
-                buf[len] = '\0';
                 char *endptr;   // Unused, but needed for strtoul().
-                RandomSeed = strtoul(buf, &endptr, 10);
+                RandomSeed = strtoul(buf + 1, &endptr, 10);
                 // Reset the random  number generator with the new seed value.
                 randomSeed(RandomSeed);
                 // Let everyone know we changed the random seed.
@@ -585,8 +593,8 @@ void HandleRemoteCommands()
             // Get the last random seed.
             // Note that the 'R' case falls through to this case.
             case 'G':
-                LOG_F(LOG_ALWAYS, "%ul\n", RandomSeed);
-                break;
+                LOG_F(LOG_ALWAYS, "%u\n", RandomSeed);
+            break;
             // Next shape - Abort the current shape and start the next.
             case 'N':
                 AbortShape = true;
@@ -594,6 +602,20 @@ void HandleRemoteCommands()
             // Keep alive - do nothing.
             case 'K':
             break;
+            // Hello - simply replies back with a canned message.
+            case 'H':
+                if (!strcmp(buf, HELLO_STRING))
+                {
+                    LOG_F(LOG_ALWAYS, "Hello Remote!\n");
+                }
+            break;
+case 'Z':
+for (uint_fast16_t i = 0; i < logbufcount; i++)            
+{
+    Serial.printf("%2d - %s\n", i, logbuf[i]);
+}
+logbufcount = 0;
+break;
             // Default - Not anything we know about.  Just ignore it.
             default:
             break;
@@ -2260,8 +2282,8 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
     // Loop to generate the plot.
     for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
     {
-        // Print the cycle countdown if verbose mode.  Note that this statement
-        // will be completely optimized out if LOG_CYCLES == 0.
+        // Print the cycle countdown if cycle log mode.  Note that this statement
+        // will be completely optimized out if LOG_CYCLES == false.
         if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);

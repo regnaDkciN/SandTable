@@ -1,7 +1,7 @@
 module OrigGear()
 {
     translate([-10, -10, 0])
-    linear_extrude(height = 5, center = true, convexity = 10)
+    linear_extrude(height = 6.4, center = true, convexity = 10)
 		import(file = "Gear Hole Test 1.10.dxf", convexity = 10, $fn = 120);
 }
 

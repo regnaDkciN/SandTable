@@ -84,8 +84,11 @@ const int SPEED_POT_PIN      = A1;          // Speed pot pin.
 const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
 
 // Hardware related constants.
-const int_fast16_t  ROT_TOTAL_STEPS   = 16000;  // Rotation axis total steps.
-const int_fast16_t  INOUT_TOTAL_STEPS = 4300;   // In/Out axis total steps.
+const int_fast32_t  MICROSTEPS        = 64;     // Microsteps used by servos.
+const int_fast32_t  ROT_TOTAL_STEPS   = 2000 * MICROSTEPS;
+                                                // Rotation axis total steps.
+const int_fast32_t  INOUT_TOTAL_STEPS = 537 * MICROSTEPS;
+                                                // In/Out axis total steps.
 const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to inout
                                                 // (small) gear.
 const float_t       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
@@ -97,9 +100,22 @@ const uint_fast16_t HOME_ROT_OFFSET   = 347 * (ROT_TOTAL_STEPS / 1000);
                                                 // The rotational offset to be applied
                                                 // after detecting the rotary home switch
                                                 // while homing.
-const uint_fast16_t MIN_FORCE_DELAY   = 100;    // Minimum servo update delay when forcing.
-const uint_fast16_t MAX_FORCE_DELAY   = 1000;   // Maximum servo update delay when forcing.
-const float_t       WIPE_RATIO        = 9.4;    // This constant should be changed based on
+const int_fast16_t  SPEED_DELAY_MIN_VAL = 1600 / MICROSTEPS;
+                                                 // Minimum axis moving delay value (uSec).
+                                                 // This macro limits the maximum speed.
+                                                 // Original code used 200.  100 is obviously
+                                                 // twice as fast, but it is also twice
+                                                 // as noisy.  The speed knob can always
+                                                 // be turned down to reduce noise if
+                                                 // desired, or this value could be
+                                                 // increased to 200 or 240.
+const int_fast16_t  SPEED_DELAY_MAX_VAL = 32000 / MICROSTEPS;
+                                                 // Maximum axis speed delay value (uSec).
+const uint_fast16_t MIN_FORCE_DELAY   = SPEED_DELAY_MIN_VAL;
+                                                // Minimum servo update delay when forcing.
+const uint_fast16_t MAX_FORCE_DELAY   = SPEED_DELAY_MAX_VAL;
+                                                // Maximum servo update delay when forcing.
+const double       WIPE_RATIO        = 9.4;    // This constant should be changed based on
                                                 // ball size.  9.4 is a good value for use
                                                 // with 3mm cylindrical magnet.
 const uint_fast16_t WIPE_RASTER_INC   = 4;      // This constant should be changed based on
@@ -123,15 +139,6 @@ const int_fast16_t  ANALOG_SHIFT_FACTOR = 4;     // Amount to shift analog pot r
 const uint_fast16_t KNOB_MIN_VAL        = 0;     // Minimum analog reading for knob.
 const uint_fast16_t KNOB_MAX_VAL        = (1 << (ANALOG_RESOLUTION - ANALOG_SHIFT_FACTOR)) - 1;
                                                 // Maximum analog reading for knob.
-const int_fast16_t  SPEED_DELAY_MIN_VAL = 100;   // Minimum axis moving delay value (uSec).
-                                                 // This macro limits the maximum speed.
-                                                 // Original code used 200.  100 is obviously
-                                                 // twice as fast, but it is also twice
-                                                 // as noisy.  The speed knob can always
-                                                 // be turned down to reduce noise if
-                                                 // desired, or this value could be
-                                                 // increased to 200 or 240.
-const int_fast16_t  SPEED_DELAY_MAX_VAL = 2000;  // Maximum axis speed delay value (uSec).
 const int_fast16_t  BRIGHTNESS_MIN_VAL  = 0;     // Minimum LED brightness value .
 const int_fast16_t  BRIGHTNESS_MAX_VAL  = 255;   // Maximum LED brightness value.
 
@@ -500,12 +507,12 @@ void HandleRemoteCommands()
         {
             // Increase speed.
             case 'F':
-                SpeedDelay -= 80;
+                SpeedDelay -= 40;
                 RemoteSpeedDelay = true;
             break;
             // Decrease speed.
             case 'S':
-                SpeedDelay += 80;
+                SpeedDelay += 40;
                 RemoteSpeedDelay = true;
             break;
             // Restore local control of speed;
@@ -514,12 +521,12 @@ void HandleRemoteCommands()
             break;
             // Increase brightness.
             case 'B':
-                Brightness += 5;
+                Brightness += 2;
                 RemoteBrightness = true;
             break;
             // Decrease brightness.
             case 'D':
-                Brightness -= 5;
+                Brightness -= 2;
                 RemoteBrightness = true;
             break;
             // Restore local control of brightness.
@@ -1003,8 +1010,10 @@ void RotateToAngle(float_t angle)
     if (RotStepsTo != RotSteps)
     {
         // Set the direction and start the move.
-        DirRot = (RotStepsTo > RotSteps) ? CW : CCW;
-        digitalWrite(DIR_ROT_PIN, DirRot);
+        DirRot = (((RotStepsTo > RotSteps) &&
+                   (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
+                  ((RotStepsTo < RotSteps) && (RotSteps - RotStepsTo > ROT_TOTAL_STEPS / 2)))
+                   ? CCW : CW;
         RotOn = true;
 
         // Wait for the move to complete.
@@ -2789,7 +2798,7 @@ void loop()
     if (firstTime)
     {
         // Wipe the board.
-        ClearFromIn();
+//        ClearFromIn();
 
         // Change this as desired.  It is the power-up greeting.
         RotateToAngle(atan2f((float_t)JMCPlot[0].y, (float_t)JMCPlot[0].x));
