@@ -105,14 +105,15 @@ void SerialLogFreeRTOS::PrintLog(const char *pFmt, ...)
         va_list args;
         va_start(args, pFmt);
         
+        // Protect our string creation and sending.
+        xSemaphoreTake(m_Mutex, pdMS_TO_TICKS(60000));
+        
         // xQueueSend() requires that a pointer to the pointer to the data be 
         // used as an argument.  Here we create a pointer to the buffer which
         // xQueueSend() can use.
         char *pString = &m_pBuffer[m_Index];
         
-        // Protect our temporary data setup and sending.
-        xSemaphoreTake(m_Mutex, pdMS_TO_TICKS(60000));
-        int_fast32_t count = vsnprintf(&m_pBuffer[m_Index], m_MaxMsgLen, pFmt, args);
+        int_fast32_t count = vsnprintf(pString, m_MaxMsgLen, pFmt, args);
         if (count > 0)
         {
             xQueueSend(m_Queue, &pString, pdMS_TO_TICKS(500));
