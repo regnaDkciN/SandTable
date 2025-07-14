@@ -19,6 +19,9 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 12-JUL-2025 JMC
+//   - Fixed limit checking in InOutServoIsr().
+//   - Other minor repairs.
 // - 19-MAY-2025 JMC
 //   - Adjusted some delay values.
 //   - Fixed RotateToAngle() to rotate in closest direction.
@@ -113,14 +116,10 @@ const uint_fast32_t HOME_ROT_OFFSET   = 353 * (ROT_TOTAL_STEPS / 1000);
 const int_fast16_t  SPEED_DELAY_MIN_VAL = 1600 / MICROSTEPS;
                                                  // Minimum axis moving delay value (uSec).
                                                  // This macro limits the maximum speed.
-                                                 // Original code used 200.  100 is obviously
-                                                 // twice as fast, but it is also twice
-                                                 // as noisy.  The speed knob can always
-                                                 // be turned down to reduce noise if
-                                                 // desired, or this value could be
-                                                 // increased to 200 or 240.
+                                                 // Smaller numbers result in faster speed.
 const int_fast16_t  SPEED_DELAY_MAX_VAL = 32000 / MICROSTEPS;
                                                  // Maximum axis speed delay value (uSec).
+                                                 // Smaller numbers result in faster speed.
 const uint_fast16_t MIN_FORCE_DELAY   = SPEED_DELAY_MIN_VAL;
                                                 // Minimum servo update delay when forcing.
 const uint_fast16_t MAX_FORCE_DELAY   = SPEED_DELAY_MAX_VAL;
@@ -139,10 +138,10 @@ const uint_fast8_t OUT             = 0;          // In/Out axis OUT direction.
 const uint_fast8_t CW              = 0;          // Rotation axis CLOCKWISE direction.
 const uint_fast8_t CCW             = 1;          // Rotation axis COUNTERCLOCKWISE direction.
 const double      PI_X_2          = PI * 2.0;   // Useful in many trig calculations.
-const double      FLOAT_PRECISION = 100.0;      // Use 2 significant digits for random floats.
+const double      FLOAT_PRECISION = 1000.0;     // Use 3 significant digits for random floats.
 
 // Potentiometer related constants.
-const int_fast32_t  PWM_FREQ            = 100000; // PWM frequency.
+const int_fast32_t  PWM_FREQ            = 100000; // LED PWM frequency.
 const int_fast16_t  ANALOG_RESOLUTION   = 12;    // Number of ADC bits.
 const int_fast16_t  ANALOG_SHIFT_FACTOR = 4;     // Amount to shift analog pot readings
                                                  // to mitigate ADC jitter.
@@ -159,7 +158,7 @@ const uint_fast16_t MIN_STAR_POINTS = 3;         // Min number of Star() points.
 const double       MAX_STAR_RATIO  = 0.95;      // Max ratio of Star() inside to outside points.
 const double       MIN_STAR_RATIO  = 0.1;       // Min ratio of Star() inside to outside points.
 
-const uint_fast16_t MAX_POLY_SIDES  = 8;         // Max number of polygon sides.
+const uint_fast16_t MAX_POLY_SIDES  = 10;        // Max number of polygon sides.
 const uint_fast16_t MIN_POLY_SIDES  = 3;         // Min number of polygon sides.
 const uint_fast16_t MIN_POLY_SIZE   = MAX_SCALE_I / 4;
                                                  // Min size of a polygon or star.
@@ -194,21 +193,21 @@ const uint_fast16_t MAX_CLOVER_VAL  = 10;        // Maximum clover shape radius 
 const uint_fast16_t MIN_CLOVER_SIZE = MAX_SCALE_I / 4;
                                                  // Minimum clover x/y size.
 const uint_fast16_t MIN_CLOVER_RES  = 6;         // Minimum clover resolution values.
-const uint_fast16_t MAX_CLOVER_RES  = 180;       // Minimum clover resolution values.
+const uint_fast16_t MAX_CLOVER_RES  = 180;       // Maximum clover resolution values.
 
 const uint_fast16_t MIN_ELLIPSE_SIZE = MAX_SCALE_I / 4;
                                                  // Minimum ellipse x-axis size;
 const double    MIN_ELLIPSE_RATIO = 1.3;        // Minimum ellipse ratio.
-const double    MAX_ELLIPSE_RATIO = 8.0;        // Mzximum ellipse ratio.
+const double    MAX_ELLIPSE_RATIO = 8.0;        // Maximum ellipse ratio.
 
 const uint_fast16_t MIN_SERIES_STEPS = 1;        // Minimum number of series steps.
-const uint_fast16_t MAX_SERIES_STEPS = 12;       // Maximum number of series steps.
-const uint_fast16_t MIN_SERIES_INC   = 8;        // Maximum size increment for series.
-const double    MAX_SERIES_ANGLE = 20.0;        // Maximum angle increment for series.
+const uint_fast16_t MAX_SERIES_STEPS = 15;       // Maximum number of series steps.
+const uint_fast16_t MIN_SERIES_INC   = 4;        // Minimum size increment for series.
+const double    MAX_SERIES_ANGLE = 10.0;        // Maximum angle increment for series.
 
 const uint_fast16_t MIN_HEART_SIZE   = MAX_SCALE_I / 4; // Minimum heart size.
 const uint_fast16_t MIN_HEART_RES    = 8;        // Minimum heart size.
-const uint_fast16_t MAX_HEART_RES    = 128;      // Minimum heart size.
+const uint_fast16_t MAX_HEART_RES    = 128;      // Maximum heart size.
 
 const uint_fast16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lines.
 const uint_fast16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
@@ -226,11 +225,11 @@ volatile double RadAngle = 0.0;      // Current angle of ball from the origin (r
 
 // General runtime variables.
 volatile int_fast32_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
-int_fast32_t          InOutStepsTo = 0;      // Number inout steps needed to reach target.
+int_fast32_t          InOutStepsTo = 0;      // In/out target steps for move.
 volatile int_fast32_t RotSteps     = 0;      // Current # steps rotary is away from 0.
-int_fast32_t          RotStepsTo   = 0;      // Number rotary steps needed to reach target.
-volatile bool         RotOn        = false;  // 'true' if rotary axis is enabled to move.
-volatile bool         InOutOn      = false;  // 'true' if inout axis is enabled to move.
+int_fast32_t          RotStepsTo   = 0;      // Rotary target steps for move.
+volatile bool         RotOn        = false;  // 'true' if rotary axis is moving.
+volatile bool         InOutOn      = false;  // 'true' if inout axis is moving.
 volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
 volatile uint_fast8_t DirRot       = CW;     // Current Rotary direction.
 int_fast16_t          InOutDelay   = 400;    // ISR delay for In/Out motor (uSec).
@@ -239,23 +238,25 @@ uint_fast32_t         RandomSeed   = 0;      // RNG seed used at startup.
 volatile uint_fast16_t MRPointCount = 0;     // Count of the number of points displayed.
 double               RotSpeedFactor= 1.0;   // Multiplicative factor for rotational speed.
 double               InOutSpeedFactor= 1.0; // Multiplicative factor for in/out speed.
-bool                  Pausing      = false;  // 'true' when pausing do to pot setting.
-volatile int_fast16_t InLimit      = 0;      // Inner limit where MotorRatios() will
-                                             // change direction or finish.
-volatile int_fast16_t OutLimit     = MAX_SCALE_I; // Outer limit where MotorRatios()
+volatile bool        Pausing      = false;  // 'true' when pausing.
+volatile int_fast16_t InLimit      = 0;      // Inner in/out limit where MotorRatios()
+                                             // will change direction or finish.
+volatile int_fast16_t OutLimit     = MAX_SCALE_I; // Outer in/out limit where MotorRatios()
                                              // will change direction or finish.
          int_fast16_t SpeedDelay   = SPEED_DELAY_MAX_VAL;
                                              // Active speed delay value.
 bool                  RemoteSpeedDelay = false; // 'true' if remotely setting speed.
 int_fast16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
 bool                  RemoteBrightness = false;   // 'true' if remotely setting brightness.
-bool                  RemotePause  = false;  // 'true' if pausing motionremotely.
-bool                  AbortShape   = false;  // 'true' if aborting ghe current shape.
+bool                  RemotePause  = false;  // 'true' if pausing motion remotely.
+volatile bool         AbortShape   = false;  // 'true' if aborting ghe current shape.
 uint_fast16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
-bool                  RandomSeedChanged = false;  // 'true' when random seed has been change.
+volatile bool         RandomSeedChanged = false;  // 'true' when random seed has been changed.
 
 // Create our stepper state machines.
 const float STEPPER_FREQUENCY = 1000000.0;  // Frequency for stepper state machines.
+
+// Create stepper objects that interface with servo related PIO state machines.
 STStepper RotStepper(  DIR_ROT_PIN,   STEP_ROT_PIN,   STEPPER_FREQUENCY);
 STStepper InOutStepper(DIR_INOUT_PIN, STEP_INOUT_PIN, STEPPER_FREQUENCY);
 
@@ -293,9 +294,9 @@ struct Coordinate
 /////////////////////////////////////////////////////////////////////////////////
 // struct PlotInfo
 //
-// This structure contains a pointer to a plot array, its size, and bool to
-// select whether or not the plot may be rotated.  It is used in RandomPlot() to
-// select a random plot array to display.
+// This structure contains a pointer to a plot array, its size, a bool to
+// select whether or not the plot may be rotated, and a name string.  It is
+// used in RandomPlot() to select a random plot array to display.
 /////////////////////////////////////////////////////////////////////////////////
 struct PlotInfo
 {
@@ -480,7 +481,7 @@ uint_fast16_t logbufcount = 0;
 /////////////////////////////////////////////////////////////////////////////////
 // HandleRemoteCommands()
 //
-// Checks for and handles remote commands froom the serial port.
+// Checks for and handles remote commands from the serial port.
 //
 // Valid commands can be either upper or lower case, and include:
 //  'F' (FASTER)      Increase the speed.
@@ -494,7 +495,7 @@ uint_fast16_t logbufcount = 0;
 //  'R 'newSeed'
 //      (RANDOM SEED) Re-seeds the random number generator with the value of
 //                    'newSeed', homes the axes and clears the board.
-//  'G' (GET)         Get the last random seed.
+//  'G' (GET)         Get the last/current random seed.
 //  'N' (NEXT)        Aborts the current shape and starts the next one.
 //  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the
 //                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
@@ -534,22 +535,22 @@ void HandleRemoteCommands()
         {
             buf[numBytesRead--] = '\0';
         } while (isspace(buf[numBytesRead]) && (numBytesRead >= 0));
-if (logbufcount < 100)        
+if (logbufcount < 100)
 {
         strncpy(logbuf[logbufcount++], buf, 50);
-} 
-LOG_F(LOG_ALWAYS, "%s....\n", buf);       
+}
+LOG_F(LOG_ALWAYS, "%s....\n", buf);
         switch (toupper(buf[0]))
         {
             // Increase speed.
             case 'F':
-                SpeedDelay -= 40;
                 RemoteSpeedDelay = true;
+                SpeedDelay -= 40;
             break;
             // Decrease speed.
             case 'S':
-                SpeedDelay += 40;
                 RemoteSpeedDelay = true;
+                SpeedDelay += 40;
             break;
             // Restore local control of speed;
             case 'Q':
@@ -557,13 +558,13 @@ LOG_F(LOG_ALWAYS, "%s....\n", buf);
             break;
             // Increase brightness.
             case 'B':
-                Brightness += 2;
                 RemoteBrightness = true;
+                Brightness += 2;
             break;
             // Decrease brightness.
             case 'D':
-                Brightness -= 2;
                 RemoteBrightness = true;
+                Brightness -= 2;
             break;
             // Restore local control of brightness.
             case 'L':
@@ -577,7 +578,7 @@ LOG_F(LOG_ALWAYS, "%s....\n", buf);
             case 'U':
                 RemotePause = false;
             break;
-            // Start with a new random seed.
+                // Re-start with a new random seed.
             case 'R':
                 // Read the new seed value.
                 char *endptr;   // Unused, but needed for strtoul().
@@ -590,7 +591,7 @@ LOG_F(LOG_ALWAYS, "%s....\n", buf);
                 // take effect at the beginning of a shape.
                 AbortShape = true;
                 [[fallthrough]];
-            // Get the last random seed.
+                // Get the (possibly) new random seed.
             // Note that the 'R' case falls through to this case.
             case 'G':
                 LOG_F(LOG_ALWAYS, "%u\n", RandomSeed);
@@ -610,7 +611,7 @@ LOG_F(LOG_ALWAYS, "%s....\n", buf);
                 }
             break;
 case 'Z':
-for (uint_fast16_t i = 0; i < logbufcount; i++)            
+for (uint_fast16_t i = 0; i < logbufcount; i++)
 {
     Serial.printf("%2d - %s\n", i, logbuf[i]);
 }
@@ -630,7 +631,7 @@ break;
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
 //
-// Ret;urns a random boolean value ('true' or 'false').
+// Returns a random boolean value ('true' or 'false').
 /////////////////////////////////////////////////////////////////////////////////
 bool RandomBool() { return (bool)random(0, 2); }
 
@@ -638,7 +639,8 @@ bool RandomBool() { return (bool)random(0, 2); }
 /////////////////////////////////////////////////////////////////////////////////
 // RandomFloat()
 //
-// Returns a random double value between minVal and maxVal with 2 digits precision.
+// Returns a random double value between minVal and maxVal with precision
+// specified by FLOAT_PRECISION.
 //
 // Arguments:
 //   - minVal : Minimum value of the returned random double.
@@ -691,7 +693,7 @@ double RtoD(double rads)
 /////////////////////////////////////////////////////////////////////////////////
 // GCD()
 //
-// Returns the greatest common divisor (gcd) of the 2 inputs.  Uses the
+// Returns the greatest common divisor (GCD) of the 2 inputs.  Uses the
 // subtraction-based Euclid's algorithm.
 //
 // Arguments:
@@ -721,7 +723,7 @@ uint_fast16_t GCD(uint_fast16_t a, uint_fast16_t b)
 /////////////////////////////////////////////////////////////////////////////////
 // LCM()
 //
-// Returns the least common multiple (lcm) of its 2 uint_fast16_t arguments.
+// Returns the least common multiple (LCM) of its 2 uint_fast16_t arguments.
 //
 // Arguments:
 //  a - The first unsigned 16-bit value.
@@ -848,16 +850,17 @@ void ForceRot(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 /////////////////////////////////////////////////////////////////////////////////
 // Home()
 //
-// Home both the in/out and rotary axes.  The home function is normally done
-// at startup in order to initialize the starting position of the axes to
-// (0, 0) coordinates.  It does not coordinate its moves with the rest of the
-// system in that the axes movements are not registered in CurrentX and CurrentY.
-// Upon completion, the pointer will be positioned to (0, 0), and all position
-// related variables will be updated to be consistent with the (0, 0) position.
+// Home both the in/out and rotary axes. Homing is normally done at startup in
+// order to initialize the cartesian starting position of the axes to (0, 0).
+// It does not coordinate its moves with the rest of the system while moving.
+// That is, the axes movements are not registered in CurrentX and CurrentY.
+// However, upon completion, the pointer will be positioned to (0, 0), and all
+// position related variables will be updated to be consistent with the (0, 0)
+// cartesian position.
 /////////////////////////////////////////////////////////////////////////////////
 void Home()
 {
-    LOG_F(LOG_INFO, "Home()\n");
+   LOG_F(LOG_INFO, "Home()\n");
 
     // Only handle the home sensor if it exists.  The compiler will optimize the
     // following code out if USE_HOME_SENSOR is 'false'.
@@ -935,14 +938,14 @@ void Home()
 /////////////////////////////////////////////////////////////////////////////////
 void ReverseKinematics(double newX, double newY)
 {
-    // Calculate radial distance from the origin to the target point.
+    // Calculate the radial distance from the origin to the target point.
     double rTo = hypot(newX, newY);
 
-    // Calculate angle from the origin using atan2().
+    // Calculate the angle from the origin using atan2().
     double angleTo = atan2(newY, newX);
 
     // atan2() returns the angle in radians in the range -pi to pi.  Convert
-    // negative angle to positive.
+    // negative angles to positive.
     if (angleTo < 0.0)
     {
         angleTo = PI_X_2 + angleTo;
@@ -965,11 +968,11 @@ void ReverseKinematics(double newX, double newY)
     {
         if (InOutSteps > InOutStepsTo)
         {
-            DirInOut = IN;  // Go in.
+            DirInOut = IN;
         }
         else
         {
-            DirInOut = OUT;  // Go out.
+            DirInOut = OUT;
         }
     }
 
@@ -1044,7 +1047,7 @@ void RotateToAngle(double angle)
         RotStepsTo -= ROT_TOTAL_STEPS;
     }
 
-    // Don't do any mnore if we're already at the target rotation.
+    // Don't do any more if we're already at the target rotation.
     if (RotStepsTo != RotSteps)
     {
         // Set the direction and start the move.
@@ -1120,7 +1123,7 @@ void GotoXY(double targetX, double targetY)
     // Calculate the total distance to travel.
     double distance = hypot(dx, dy);
     // Calculate the number of steps required, and round.
-    // Adjust stepsPerUnit according to your system.
+    // Adjust STEPS_PER_UNIT according to your system.
     uint_fast16_t steps = (uint_fast16_t)round(distance * STEPS_PER_UNIT);
     // Exit right away if the move is too small.
     if (steps != 0)
@@ -1194,11 +1197,11 @@ void RotateGotoXY(double targetX, double targetY, double angle)
 //
 // Returns:
 //   Always returns the value of the specified analog input shifted right by
-//   ANALOG_SHIFT_FACTOR bits.  This is done to work around the 2350 analog in
+//   ANALOG_SHIFT_FACTOR bits.  This is done to work around the RP2350 analog in
 //   noise problem.
 //
 // Note:
-//   Due to noise problems with the 2350 ADC, we reduce our ADC resolution by
+//   Due to noise problems with the RP2350 ADC, we reduce our ADC resolution by
 //   4 bits (from 12 bits to 8 bits).  This is done by shifting the (noisy) 4
 //   least significant bits out, leaving only the 8  most significant bits,
 //   which is fine for this system.  A proper fix would require hardware
@@ -1219,7 +1222,7 @@ inline uint_fast16_t ReadAPot(int pot)
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateLeds()
 {
-    // Only read left BRIGHTNESS pot if we're not being controlled remotely.
+    // Only read the left BRIGHTNESS pot if we're not being controlled remotely.
     if (!RemoteBrightness)
     {
         // The pot on the left is for the LEDs.  Read it now.
@@ -1249,7 +1252,7 @@ bool UpdateSpeeds()
     // Only read the right SPEED pot if we're not being controlled remotely.
     if (!RemoteSpeedDelay)
     {
-        // Pot on the right for drawing speed or delay.  Read it now.
+        // Pot on the right is for drawing speed or delay.  Read it now.
         uint_fast16_t speedKnobVal = ReadAPot(SPEED_POT_PIN);
         SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
@@ -1427,8 +1430,8 @@ void GenerateSeriesSteps(uint_fast16_t size, uint_fast16_t &steps,
     sizeInc = (MAX_SCALE_I - size) / steps;
     sizeInc = max(sizeInc, MIN_SERIES_INC);
     steps   = 1 + (MAX_SCALE_I - size) / sizeInc;
-    rotInc  = RandomFloat(0.0, DtoR(MAX_SERIES_ANGLE));
-    LOG_F(LOG_INFO, "(%d,%d,%d,%.2f)\n", size, steps, sizeInc, rotInc);
+    rotInc  = RandomFloat(-DtoR(MAX_SERIES_ANGLE), DtoR(MAX_SERIES_ANGLE));
+    LOG_F(LOG_INFO, "(%d,%d,%d,%.2f)\n", size, steps, sizeInc, RtoD(rotInc));
 } // End GenerateSeriesSteps().
 
 
@@ -1500,9 +1503,9 @@ void EllipseSeries()
 {
     LOG_F(LOG_INFO, "EllipseSeries");
 
-    // Usefull constants.
+    // Useful constants.
     const uint_fast16_t MIN_LOBES = 1;   // Need at least one lobe.
-    const uint_fast16_t MAX_LOBES = 2;   // For series, no more than 2 lobes.
+    const uint_fast16_t MAX_LOBES = 9;   // For series, no more than 2 lobes.
 
     // Generate some legal arguments for the calls to Circle().
     uint_fast16_t lobes  = random(MIN_LOBES, MAX_LOBES + 1);
@@ -1512,7 +1515,7 @@ void EllipseSeries()
                   ySize  = constrain(ySize, MIN_ELLIPSE_SIZE, MAX_SCALE_I);
     double       rot    = RadAngle;
 
-    // Determine how many steps to take, and how much to increase size and
+    // Determine how many steps to take, and how much to increase size and rotation.
     uint_fast16_t steps = 0;
     uint_fast16_t sizeInc = 0;
     double       rotInc = 0.0;
@@ -1525,7 +1528,7 @@ void EllipseSeries()
         Circle(lobes, xSize, ySize, rot);
         xSize += sizeInc;
         ySize += sizeInc;
-        rot += rotInc;
+        rot += 1.5 * rotInc;
     }
     EndSeries();
 } // End EllipseSeries().
@@ -1688,6 +1691,7 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
         cycles = LCM(fixedR, outerR) / fixedR;
         cycles = min(cycles, MAX_CYCLES);
     }
+    uint_fast32_t iterations = res * cycles;
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.  Since we always start our shape with a 0 degree angle,
@@ -1695,11 +1699,11 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
     double offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint_fast32_t i = 0; (i <= res * cycles) && !AbortShape; i++)
+    for (uint_fast32_t i = 0; (i <= iterations) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i % res == 0))
+        if (LOG_CYCLES && (i < iterations) && (i % res == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", cycles - i / res);
         }
@@ -1707,7 +1711,7 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
         // Calculate the angle for this point.
         double angle = baseAngle * (double)i;
 
-        // Calculate the Spirograph coordinates.
+        // Calculate the coordinates.
         double x = rSum * cos(angle) - outerR * cos(angleFactor * angle);
         double y = rSum * sin(angle) - outerR * sin(angleFactor * angle);
 
@@ -1738,7 +1742,7 @@ void RandomClover()
     uint_fast16_t ySize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
     uint_fast16_t res   = random(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
 
-    // Make the call to Rose().
+    // Make the call to Clover().
     Clover(a, b, xSize, ySize, res);
 } // End RandomClover().
 
@@ -1829,7 +1833,7 @@ void HeartSeries()
 // Note: - The motors will move at a rate of 10 / ratio.  The factor of 10 is due
 //         to the 10:1 gear ratio used for the rotaty axis.
 //       - If 'multiplePoints' is 'true', then the in/out axis will reverse direction
-//         when reaching the positive or zero extent of the arm.  It will
+//         when reaching the inLimit or outLimit of the arm.  It will
 //         continue doing this until a calculated number of points has been
 //         created.  If 'multiplePoints' is 'false', the curve will terminate once
 //         the in/out arm reaches either of its extents.
@@ -2031,10 +2035,11 @@ void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate,
         RotateGotoXY(x, y, rotation);
 
         // NOTE: Here is a rudimentary single stepping mechanism.  It can be used
-        //       determine redundant/useless coordinates that may be removed from
-        //       a new shape array.  These can then be removed in order to
-        //       conserve memory.  It will be completely optimized out if
-        //       LOG_STEP == 0.
+        //       to find redundant/useless coordinates that may safely be removed
+        //       from a shape array without changing the resulting display.
+        //       These can then be removed in order to conserve memory and improve
+        //       execution speed.  The code will be completely optimized out if
+        //       LOG_STEP is false.
         if (LOG_STEP)
         {
             // Display the current index and position.
@@ -2157,7 +2162,7 @@ void RandomLines()
     // Generate the random lines.
     for (uint_fast16_t i = numPoints; i; i--)
     {
-        LOG_F(LOG_INFO, "%d\n", i);
+        LOG_F(LOG_CYCLES, "%d\n", i);
 
         GotoXY(random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1),
                random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1));
@@ -2168,7 +2173,7 @@ void RandomLines()
 /////////////////////////////////////////////////////////////////////////////////
 // Rose()
 //
-// Draw a rose curve is a curve which has the shape of a petalled flower.
+// Draw a rose curve.  This is a curve which has the shape of a petalled flower.
 //
 // Arguments:
 //   - num   : Numerator.
@@ -2204,7 +2209,7 @@ void Rose(uint_fast16_t num, uint_fast16_t denom, uint_fast16_t xSize,
     // Loop to create the curve.
     for (uint_fast16_t i = 0; (i <= cycles) && !AbortShape; i++)
     {
-        if (LOG_CYCLES && (i % res == 0))
+        if (LOG_CYCLES && (cycles - i >= res) && (i % res == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", (cycles - i) / res);
         }
@@ -2284,7 +2289,7 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
     {
         // Print the cycle countdown if cycle log mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == false.
-        if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
@@ -2365,7 +2370,7 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
@@ -2454,7 +2459,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
         {
             LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
         }
@@ -2597,7 +2602,7 @@ void SuperStar(uint_fast16_t numNodes, uint_fast16_t size, bool outline,
     LOG_F(LOG_INFO, "SuperStar(%d,%d,%d,%.1f)\n", numNodes, size, outline, RtoD(rotation));
 
     // If we are drawing a perimeter, then initial skip is 1.  Otherwise it is 2.
-    uint_fast16_t initialSkip = (outline || (numNodes < 4)) ? 1 : 2;
+    uint_fast16_t initialSkip = (outline || (numNodes <= 4)) ? 1 : 2;
 
     // Move to our start point.
     GotoXY(scale * cos(rotation), scale * sin(rotation));
@@ -2749,7 +2754,7 @@ void ResetShapes()
 /////////////////////////////////////////////////////////////////////////////////
 // setup()
 //
-// This function initializes all the hardware, and homes the axes to (0, 0).
+// This function initializes all the hardware and creates all system tasks.
 /////////////////////////////////////////////////////////////////////////////////
 void setup()
 {
@@ -2783,7 +2788,8 @@ void setup()
         pinMode(ROT_HOME_PIN, INPUT_PULLUP);
     }
 
-    // Initialize our serial port, wait for port to open, and issue a "Starting" message.
+    // Initialize our serial port, wait for port to open, and issue a "Starting"
+    // message.
     Serial.begin(115200);
     delay(100);
     LOG_F(LOG_ALWAYS, "\r\nStarting\n");
@@ -2877,7 +2883,7 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 
 /////////////////////////////////////////////////////////////////////////////////
-// ISR(TIMER1_COMPA_vect)
+// RotaryServoIsr()
 //
 // This is the ISR for the rotational motor.
 /////////////////////////////////////////////////////////////////////////////////
@@ -2958,11 +2964,11 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
     // causes the timer subsystem to reschedule the alarm this many microseconds
     // from the time this ISR started.
     return -RotDelay;
-} // End ISR(TIMER1_COMPA_vect).
+} // End RotaryServoIsr().
 
 
 /////////////////////////////////////////////////////////////////////////////////
-// ISR(TIMER1_COMPB_vect)
+// InOutServoIsr()
 //
 // This is the ISR for the in/out motor.
 /////////////////////////////////////////////////////////////////////////////////
@@ -2990,7 +2996,7 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             InOutSteps--;
         }
 
-        // Handle normal case of not using multiple points first.
+        // Handle the normal case of not using multiple points first.
         if (MRPointCount == 0)
         {
             // Complete the move if we've reached our target and are not
@@ -3011,11 +3017,11 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 lastMRPoints = true;
             }
             // Adjust the direction if limits are reached.
-            if (InOutSteps > OutLimit)
+            if (InOutSteps >= OutLimit)
             {
                 DirInOut = IN;
             }
-            else if (InOutSteps < InLimit)
+            else if (InOutSteps <= InLimit)
             {
                 DirInOut = OUT;
             }
@@ -3039,4 +3045,4 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
     // causes the timer subsystem to reschedule the alarm this many microseconds
     // from the time this ISR started.
     return -InOutDelay;
-} // End ISR(TIMER1_COMPB_vect).
+} // End InOutServoIsr().

@@ -21,13 +21,18 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 12-JUL-2025 JMC
+//   - Fixed limit checking in InOutServoIsr().
+//   - Split servo handling into separate tasks for planning and servo controlling.
+//     This allows us to queue moves ahead and eliminate delays between consecutive
+//     moves due to position update calculations.
+//   - Other minor repairs.
 // - 28-JUN-2025 JMC
 //   - Major changes to work with FreeRTOS.  Moved all serial and analog handling
 //     to core 1.  Kept main path and shape generation coded on core 0.
 //   - Fixed reading from the serial port in HandleRemoteCommandsTask().
 //   - Made current shape invocation string fetchable via the serial port.
 //   - Moved Home() call from setup to start of path task.
-//   - Other minor repairs.
 // - 19-MAY-2025 JMC
 //   - Adjusted some delay values.
 //   - Fixed RotateToAngle() to rotate in closest direction.
@@ -290,6 +295,23 @@ volatile uint_fast8_t LastInOutDir = DirInOut;
 volatile uint_fast16_t LastMRPoints = 0;
 
 
+// Planner related variables.
+TaskHandle_t      ServoCtrlHandle    = NULL;    // Handle for servo control task.
+QueueHandle_t     PlannerQueueHandle = 0;       // Handle for planner queue.
+const UBaseType_t PLANNER_Q_LENGTH   = 10;      // Num entries in planner queue.
+volatile double   PlannerCurrentX    = 0.0;     // Planned location of ball (X).
+volatile double   PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
+volatile bool     MoveInProcess      = false;   // True if moves are in process.
+
+// PlannerData structure.  Used to pass data between the planner and the
+// servo controller task.
+struct PlannerData
+{
+    int_fast32_t m_InOutStepsTo;    // In/out target steps for move.
+    int_fast32_t m_RotStepsTo;      // Rotary target steps for move.
+};
+
+
 /////////////////////////////////////////////////////////////////////////////////
 // F O R W A R D   D E C L A R A T I O N S
 /////////////////////////////////////////////////////////////////////////////////
@@ -297,6 +319,8 @@ void    MotorRatios(double ratio, bool multiplePoints,
                  int_fast16_t inLimit = 0, int_fast16_t outLimit = MAX_SCALE_I);
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data);
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data);
+void EndShape(bool delay = true);
+void LogExecutionStats();
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -360,12 +384,14 @@ public:
     //   - delay  : The number of execution cycles that must elapse between
     //              executions of *pShape().
     /////////////////////////////////////////////////////////////////////////////
-    ShapeInfo(void (*pShape)(), uint_fast16_t delay)
+    ShapeInfo(const char *pName, void (*pShape)(), uint_fast16_t delay)
     {
         // Initialize our data based on our arguments.
+        m_pName     = pName;
         m_pShape    = pShape;
         m_Delay     = delay;
         m_LastCycle = 0;
+        m_Count     = 0;
     } // End constructor.
 
 
@@ -388,6 +414,7 @@ public:
         if (cycle - m_LastCycle >= m_Delay)
         {
             // Yes, it's ok to make our shape.  Do it!
+            m_Count++;
             (*m_pShape)();
 
             // Remember that we just executed.
@@ -409,7 +436,30 @@ public:
     void Reset()
     {
         m_LastCycle = 0;
+        m_Count     = 0;
     } // End Reset().
+
+
+    /////////////////////////////////////////////////////////////////////////////
+    // GetCount()
+    //
+    // Returns the usage count.
+    /////////////////////////////////////////////////////////////////////////////
+    uint_fast32_t GetCount()
+    {
+        return m_Count;
+    } // End GetCount().
+
+
+    /////////////////////////////////////////////////////////////////////////////
+    // GetName()
+    //
+    // Returns the usage count.
+    /////////////////////////////////////////////////////////////////////////////
+    const char *GetName()
+    {
+        return m_pName;
+    } // End GetName().
 
 
 private:
@@ -417,9 +467,11 @@ private:
     ShapeInfo();
     ShapeInfo &operator=(ShapeInfo &);
 
+    const char   *m_pName;       // Name string.
     void         (*m_pShape)();  // Pointer to function to execute if not too soon.
     uint_fast16_t m_Delay;       // Number of iterations between consecutive executions.
     uint_fast16_t m_LastCycle;   // Iteration that we last executed.
+    uint_fast32_t m_Count;       // Count of number of times executed.
 }; // End class ShapeInfo.
 
 
@@ -501,9 +553,11 @@ const Coordinate JMCPlot[] =
 
 }; // End JMCPlot.
 
+
 /////////////////////////////////////////////////////////////////////////////////
 // S U P P O R T   F U N C T I O N S
 /////////////////////////////////////////////////////////////////////////////////
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // HandleRemoteCommandsTask()
@@ -528,6 +582,7 @@ const Coordinate JMCPlot[] =
 //                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
 //                    remote settings get cleared and local control is restored.
 //  'C' (CUR SHAPE)   Gets the invocation string of the current shape.
+//  'E' (EXEC COUNT)  Displays count of each shape's executions.
 //  '+' (NEXT SEGMNT) Used for single stepping plot array shapes.  When detected,
 //                    steps to next segment.
 //  '-' (PREV SEGMNT) Used for single stepping plot array shapes.  When detected,
@@ -626,6 +681,8 @@ void HandleRemoteCommandsTask(__unused void *param)
                     // Abort the current shape since we want the new random value to
                     // take effect at the beginning of a shape.
                     AbortShape = true;
+                    // Make sure to empty our planner queue.
+                    xQueueReset(PlannerQueueHandle);
                     taskEXIT_CRITICAL();
                     [[fallthrough]];
                 // Get the (possibly) new random seed.
@@ -635,7 +692,11 @@ void HandleRemoteCommandsTask(__unused void *param)
                 break;
                 // Next shape - Abort the current shape and start the next.
                 case 'N':
+                    taskENTER_CRITICAL();
                     AbortShape = true;
+                    // Make sure to empty our planner queue.
+                    xQueueReset(PlannerQueueHandle);
+                    taskEXIT_CRITICAL();
                 break;
                 // Keep alive - do nothing.
                 case 'K':
@@ -651,6 +712,10 @@ void HandleRemoteCommandsTask(__unused void *param)
                 // being generated.
                 case 'C':
                     LOG_F(LOG_ALWAYS, CurrentShapeString);
+                break;
+                // Show execution statistics.
+                case 'E':
+                LogExecutionStats();
                 break;
                 // Step to next shape array segment.
                 case '+':
@@ -672,7 +737,6 @@ void HandleRemoteCommandsTask(__unused void *param)
         vTaskDelay(pdMS_TO_TICKS(5));
     } // End while (1)  Tasks never return.
 } // End HandleRemoteCommandsTask().
-
 
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
@@ -816,8 +880,8 @@ void Reduce(uint_fast16_t &a, uint_fast16_t &b)
 void CalculateXY()
 {
     double r = (double)(InOutSteps * MAX_SCALE_I) / (double)INOUT_TOTAL_STEPS;
-    CurrentX  = r * cos(RadAngle);
-    CurrentY  = r * sin(RadAngle);
+    CurrentX = r * cos(RadAngle);
+    CurrentY = r * sin(RadAngle);
 } // End CalculateXY().
 
 
@@ -942,117 +1006,44 @@ void Home()
         DirRot = CW;
         while (!IsRotHome())
         {
-             ForceRot(1, DirRot, MAX_FORCE_DELAY / 4);
+             ForceRot(1, DirRot, MIN_FORCE_DELAY * 2);
         }
 
         // Disable inout to eliminate clicking on CW move.
         DisableInOut();
         // Apply the homing rotational offset (if any).
         DirRot = CCW;
-        ForceRot(HOME_ROT_OFFSET, DirRot, MIN_FORCE_DELAY * 3);
+        ForceRot(HOME_ROT_OFFSET, DirRot, MIN_FORCE_DELAY * 2);
     } // End USE_HOME_SENSOR.
 
     // Retract the inout axis all the way (to zero).
     DirInOut = IN;
-    ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY * 3);
+    ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY * 2);
 
     // We are now at position (0, 0).  Update our position related variables.
-    CurrentX       = 0.0;
-    CurrentY       = 0.0;
-    InOutSteps     = 0;
-    InOutStepsTo   = 0;
-    RotSteps       = 0;
-    RotStepsTo     = 0;
-    RotOn          = false;
-    InOutOn        = false;
-    MRPointCount   = 0;
-    InLimit        = 0;
-    OutLimit       = MAX_SCALE_I;
-    InOutCompAccum = 0;
-    LastMRPoints   = 0;
-    LastInOutDir   = DirInOut;
+    CurrentX        = 0.0;
+    CurrentY        = 0.0;
+    PlannerCurrentX = 0.0;
+    PlannerCurrentY = 0.0;
+    InOutSteps      = 0;
+    InOutStepsTo    = 0;
+    RotSteps        = 0;
+    RotStepsTo      = 0;
+    RotOn           = false;
+    InOutOn         = false;
+    MRPointCount    = 0;
+    InLimit         = 0;
+    OutLimit        = MAX_SCALE_I;
+    InOutCompAccum  = 0;
+    LastMRPoints    = 0;
+    LastInOutDir    = DirInOut;
+
+    EndShape(false);
 
     // Enable both motors.  This should be done last.
     EnableInOut();
     EnableRot();
 } // End Home().
-
-
-/////////////////////////////////////////////////////////////////////////////////
-// ReverseKinematics()
-//
-// This function calculates the necessary values of RotStepsTo and InOutStepsTo
-// given the (X, Y) coordinates of the target position (i.e. it performs a
-// reverse kinematics operation).  RotStepsTo and InOutStepsTo are in motor
-// counts from zero, and are used by the motor driver ISRs to position the
-// axes to the specified target location.
-//
-// Arguments:
-//   - newX : This is the target X coordinate position.
-//   - newY : This is the target Y coordinate position.
-/////////////////////////////////////////////////////////////////////////////////
-void ReverseKinematics(double newX, double newY)
-{
-    // Calculate the radial distance from the origin to the target point.
-    double rTo = hypot(newX, newY);
-
-    // Calculate the angle from the origin using atan2().
-    double angleTo = atan2(newY, newX);
-
-    // atan2() returns the angle in radians in the range -pi to pi.  Convert
-    // negative angles to positive.
-    if (angleTo < 0.0)
-    {
-        angleTo = PI_X_2 + angleTo;
-    }
-
-    // Calculate the rotation steps and limit as needed.
-    RotStepsTo = round((angleTo * ROT_TOTAL_STEPS) / PI_X_2);
-    if (RotStepsTo >= ROT_TOTAL_STEPS)
-    {
-        RotStepsTo -= ROT_TOTAL_STEPS;
-    }
-
-    // Calculate the in/out steps and limit as needed.
-    InOutStepsTo = round((rTo * INOUT_TOTAL_STEPS) / MAX_SCALE_F);
-    InOutStepsTo = constrain(InOutStepsTo, 0, INOUT_TOTAL_STEPS);
-
-    // Determine whether to go IN or OUT.
-    bool bInOutON = (InOutSteps != InOutStepsTo);
-    if (bInOutON)
-    {
-        if (InOutSteps > InOutStepsTo)
-        {
-            DirInOut = IN;
-        }
-        else
-        {
-            DirInOut = OUT;
-        }
-    }
-
-    // Determine whether to go CW or CCW.
-    bool bRotON = (RotSteps != RotStepsTo);
-    if (bRotON)
-    {
-        if (((RotStepsTo > RotSteps) &&
-             (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
-             ((RotStepsTo < RotSteps) && (RotSteps - RotStepsTo > ROT_TOTAL_STEPS / 2)))
-        {
-            DirRot = CCW;
-        }
-        else
-        {
-            DirRot = CW;
-        }
-    }
-
-    // Start the move atomically.
-    taskENTER_CRITICAL();
-    InOutOn = bInOutON;
-    RotOn   = bRotON;
-    taskEXIT_CRITICAL();
-} // End ReverseKinematics().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1076,6 +1067,7 @@ inline void DisableRot()   { digitalWrite(EN_ROT_PIN,   HIGH); }
 void ExtendInOut()
 {
     GotoXY(MAX_SCALE_F * cos(RadAngle), MAX_SCALE_F * sin(RadAngle));
+    WaitForMoveComplete();
 } // End ExtendInOut().
 
 
@@ -1132,23 +1124,170 @@ inline bool IsRotHome()  { return !digitalRead(ROT_HOME_PIN); }
 
 
 /////////////////////////////////////////////////////////////////////////////////
-// MoveTo()
+// ReverseKinematics()
 //
-// Move to a specified point in an uncoordinated manner (without interpolation).
+// This function calculates the necessary values of RotStepsTo and InOutStepsTo
+// given the (X, Y) coordinates of the target position (i.e. it performs a
+// reverse kinematics operation).  RotStepsTo and InOutStepsTo are in motor
+// counts from zero, and are used by the motor driver ISRs to position the
+// axes to the specified target location.
 //
 // Arguments:
-//   x, y : The cartesian coordinates of the target position.
+//   - newX : This is the target X coordinate position.
+//   - newY : This is the target Y coordinate position.
 /////////////////////////////////////////////////////////////////////////////////
-void MoveTo(double x, double y)
+void ReverseKinematics(double newX, double newY)
 {
-    // Calculate the target in/out and rotary values and start moving.
-    ReverseKinematics(x, y);
+    // Temporary planner position data.
+    PlannerData newPosData;
 
-    // Wait until the target is reached.
-    while (RotOn || InOutOn)
+    // Calculate the radial distance from the origin to the target point.
+    double rTo = hypot(newX, newY);
+
+    // Calculate the angle from the origin using atan2().
+    double angleTo = atan2(newY, newX);
+
+    // atan2() returns the angle in radians in the range -pi to pi.  Convert
+    // negative angles to positive.
+    if (angleTo < 0.0)
     {
+        angleTo = PI_X_2 + angleTo;
     }
-} // End MoveTo().
+
+    // Calculate the rotation steps and limit as needed.
+    newPosData.m_RotStepsTo = round((angleTo * ROT_TOTAL_STEPS) / PI_X_2);
+    if ( newPosData.m_RotStepsTo >= ROT_TOTAL_STEPS)
+    {
+         newPosData.m_RotStepsTo -= ROT_TOTAL_STEPS;
+    }
+
+    // Calculate the in/out steps and limit as needed.
+     newPosData.m_InOutStepsTo = round((rTo * INOUT_TOTAL_STEPS) / MAX_SCALE_F);
+     newPosData.m_InOutStepsTo = constrain(newPosData.m_InOutStepsTo, 0, INOUT_TOTAL_STEPS);
+
+    // Queue data to servo control task.  Note that when an abort shape is
+    // commanded, this queue will be reset, so we can wait infinitely here.
+    xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(9999999));
+
+} // End ReverseKinematics().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// WaitForMoveComplete()
+//
+// Waits for all queued motion to complete.  Returns an indication of whether
+// or not too much time occurred with motion still queued.  On timeout,
+// it tries to correct the problem by resetting the motion queue and signaling
+// the servo control task.
+//
+// Returns:
+//   Returns 'true' if motion completed.  Returns 'false' if too much time
+//   elapsed with motion still in process.
+/////////////////////////////////////////////////////////////////////////////////
+bool WaitForMoveComplete()
+{
+    bool moveComplete = true;
+    uint_fast32_t MOVE_TIMEOUT_MS = 1000;
+    uint_fast32_t timeLeftMs = MOVE_TIMEOUT_MS;
+
+    // Wait for shape to complete.
+    while ((MoveInProcess || uxQueueMessagesWaiting(PlannerQueueHandle)) &&
+           !AbortShape && timeLeftMs--)
+    {
+        // Don't time out if we're pausing.
+        if (Pausing)
+        {
+            timeLeftMs = MOVE_TIMEOUT_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // If we timed out, then something is wrong.  Reset the queue.
+    if (!timeLeftMs || AbortShape)
+    {
+        xQueueReset(PlannerQueueHandle);
+        xTaskNotify(ServoCtrlHandle, 0, eNoAction);
+        moveComplete = false;
+        LOG_F(LOG_INFO, "WaitForMoveComplete() timed out.\n");
+    }
+
+    return moveComplete;
+} // End WaitForMoveComplete().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// ServoControlTask()
+//
+// Move to a specified point in an uncoordinated manner (without interpolation).
+// Wait for new servo position data and start the servos moving.  Wait for move
+// to complete.
+/////////////////////////////////////////////////////////////////////////////////
+void ServoControlTask(__unused void *param)
+{
+    PlannerData data;
+
+    // Delay before starting the task to give the print task time to start up.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    while (1)
+    {
+        MoveInProcess = false;
+        if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)))
+        {
+            MoveInProcess = true;
+            InOutStepsTo = data.m_InOutStepsTo;
+            RotStepsTo   = data.m_RotStepsTo;
+
+            // Determine whether to go IN or OUT.
+            bool bInOutON = (InOutSteps != InOutStepsTo);
+            if (bInOutON)
+            {
+                if (InOutSteps > InOutStepsTo)
+                {
+                    DirInOut = IN;
+                }
+                else
+                {
+                    DirInOut = OUT;
+                }
+            }
+
+            // Determine whether to go CW or CCW.
+            bool bRotON = (RotSteps != RotStepsTo);
+            if (bRotON)
+            {
+                if (((RotStepsTo > RotSteps) &&
+                     (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
+                     ((RotStepsTo < RotSteps) && (RotSteps - RotStepsTo > ROT_TOTAL_STEPS / 2)))
+                {
+                    DirRot = CCW;
+                }
+                else
+                {
+                    DirRot = CW;
+                }
+            }
+
+            if (bRotON || bInOutON)
+            {
+                // Make sure we start with the servo complete flag inactive.
+                xTaskNotifyStateClear(ServoCtrlHandle);
+
+                // Start the move atomically.
+                taskENTER_CRITICAL();
+                InOutOn = bInOutON;
+                RotOn   = bRotON;
+                taskEXIT_CRITICAL();
+
+                // Wait until the target is reached or an abort is commanded.
+                while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) && !AbortShape)
+                {
+                    // Do nothing.
+                }
+            }
+        }
+    }
+} // End ServoControlTask().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1171,19 +1310,20 @@ void GotoXY(double targetX, double targetY)
         targetY = trunc(MAX_SCALE_F * sin(angle));
     }
     // Calculate the difference between target and current positions.
-    double dx = targetX - CurrentX;
-    double dy = targetY - CurrentY;
+    double dx = targetX - PlannerCurrentX;
+    double dy = targetY - PlannerCurrentY;
     // Calculate the total distance to travel.
     double distance = hypot(dx, dy);
     // Calculate the number of steps required, and round.
     // Adjust STEPS_PER_UNIT according to your system.
     uint_fast16_t steps = (uint_fast16_t)round(distance * STEPS_PER_UNIT);
+
     // Exit right away if the move is too small.
     if (steps != 0)
     {
         // Initialize our intermediate position variables.
-        double newX = CurrentX;
-        double newY = CurrentY;
+        double newX = PlannerCurrentX;
+        double newY = PlannerCurrentY;
 
         // Calculate the increments per step.
         double incrementX = dx / steps;
@@ -1196,15 +1336,15 @@ void GotoXY(double targetX, double targetY)
             newX += incrementX;
             newY += incrementY;
 
-            // Move the motors to the intermediate position.
-            MoveTo(newX, newY);
+            // Perform fine interpolation and send new command data to the servos.
+            ReverseKinematics(newX, newY);
         }
 
         // Update the current position.
-        // Note that due to rounding of floats, it is better to re-calculate
-        // our current position based on in/out and rotary values than to use
-        // newX and newY here
+        PlannerCurrentX = newX;
+        PlannerCurrentY = newY;
         CalculateXY();
+
     }
 } // End GotoXY().
 
@@ -1410,6 +1550,8 @@ void StartShape(const char *pFmt, ...)
         vsnprintf(CurrentShapeString, MAX_LOG_STRING_SIZE, pFmt, args);
         LOG_F(LOG_INFO, CurrentShapeString);
     }
+    PlannerCurrentX = CurrentX;
+    PlannerCurrentY = CurrentY;
 } // End StartShape().
 
 
@@ -1422,7 +1564,7 @@ void StartShape(const char *pFmt, ...)
 // macro, execution will stop at the end of every shape until the speed pot is
 // set to zero then non-zero.
 /////////////////////////////////////////////////////////////////////////////////
-void EndShape()
+void EndShape(bool delay)
 {
     // Announce that the shape is done.
     LOG_F(LOG_INFO, "End Shape\n");
@@ -1435,16 +1577,16 @@ void EndShape()
         {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
-
-        // Now wait for speed pot pause to be cleared.
-        while (Pausing)
-        {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
     }
 
-    // Delay a bit to allow time to set speed pot back to desired value.
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Wait for shape to complete.
+    WaitForMoveComplete();
+
+    // Delay a bit if requested.
+    if (delay)
+    {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
 } // End EndShape().
 
 
@@ -1457,6 +1599,9 @@ void EndShape()
 void EndSeries()
 {
     LOG_F(LOG_INFO, "End Series\n");
+    
+    // Delay a bit.
+     vTaskDelay(pdMS_TO_TICKS(3000));
 } // End EndSeries().
 
 
@@ -1529,6 +1674,7 @@ void Circle(uint_fast16_t numLobes, uint_fast16_t xSize,
         double y = (double)ySize * sin(numLobes * angle);
         RotateGotoXY(x, y, rotation);
     }
+    EndShape(false);
 } // End Circle().
 
 
@@ -1604,12 +1750,15 @@ void ClearFromIn(double = 0.0)
 
     // Moe to our start point (0, 0).
     GotoXY(0, 0);
+    WaitForMoveComplete();
 
     // Take care of any position loss by forcing more IN.
     ForceInOut(1, IN, MAX_FORCE_DELAY);
 
     // Do the wipe.
     MotorRatios(WIPE_RATIO, false);
+
+    EndShape();
 } // End ClearFromIn().
 
 
@@ -1629,6 +1778,8 @@ void ClearFromOut(double = 0.0)
     ExtendInOut();
 
     MotorRatios(WIPE_RATIO, false);
+
+    EndShape();
 } // End ClearFromOut().
 
 
@@ -1661,6 +1812,7 @@ void ClearLeftRight(double rotation = 0.0)
             RotateGotoXY(xt, newY, rotation);
         }
     }
+    EndShape();
 } // End ClearLeftRight().
 
 
@@ -1688,8 +1840,8 @@ void (*const Wipes[])(double) =
 /////////////////////////////////////////////////////////////////////////////////
 void RandomWipe()
 {
-    // Start at the origin to eliminate noise when in/out fully extends.
-    GotoXY(0, 0);
+    // Start with in/out fully retracted to eliminate noise when in/out fully extends.
+    ForceInOut(InOutSteps, IN, MIN_FORCE_DELAY * 2);
 
     // Perform a home to keep in axes in sync since we can occasionally
     // lose position.
@@ -1772,6 +1924,7 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(xSize * x, ySize * y, offsetAngle);
     }
+    EndShape();
 } // End Clover().
 
 
@@ -1833,6 +1986,7 @@ void Heart(uint_fast16_t size, double rotation, uint_fast16_t res)
                     (-1.0 / 16.0) * cos(4.0 * angle));
         RotateGotoXY(x, y, rotation);
     }
+    EndShape(false);
 } // End Heart().
 
 
@@ -1956,10 +2110,10 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
     }
 
     // Start the move by turning the motors on atomically.
-    noInterrupts();
+    taskENTER_CRITICAL();
     RotOn   = true;
     InOutOn = true;
-    interrupts();
+    taskEXIT_CRITICAL();
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
     // MRPointCount equals 0;
@@ -1985,6 +2139,7 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
     OutLimit = MAX_SCALE_I;
     SetSpeedFactors(1.0, 1.0);
     CalculateXY();       // Update our current position variables.
+    EndShape();
 } // End MotorRatios().
 
 
@@ -2117,6 +2272,7 @@ void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate,
 
         } // End LOG_STEP
     } // End for().
+    EndShape();
 } // End PlotShapeArray().
 
 
@@ -2158,6 +2314,7 @@ void Polygon(uint_fast16_t numSides, uint_fast16_t size, double rotation)
         double angle = rotation + (PI_X_2 * (double)i) / (double)numSides;
         GotoXY(scale * cos(angle), scale * sin(angle));
     }
+    EndShape(false);
 } // End Polygon().
 
 
@@ -2213,6 +2370,7 @@ void RandomLines()
         GotoXY(random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1),
                random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1));
     }
+    EndShape();
 } // End RandomLines().
 
 
@@ -2266,6 +2424,7 @@ void Rose(uint_fast16_t num, uint_fast16_t denom, uint_fast16_t xSize,
         double y = ySize * r * sin(theta);
         GotoXY(x, y);
     }
+    EndShape();
 } // End Rose().
 
 
@@ -2350,6 +2509,7 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(x, y, offsetAngle);
     }
+    EndShape();
 } // End Spirograph().
 
 
@@ -2442,6 +2602,7 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
         // offsetAngle value.
         RotateGotoXY(x2, y2, offsetAngle);
     }
+    EndShape();
 } // End Spirograph2().
 
 
@@ -2539,6 +2700,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
         // offsetAngle value.
         RotateGotoXY(x, y, offsetAngle);
     }
+    EndShape();
 } // End SpirographWithSquare().
 
 
@@ -2587,6 +2749,7 @@ void Star(uint_fast16_t numPoints, double ratio, uint_fast16_t size,
         double scale = size * ((i % 2) ? ratio : 1.0);
         GotoXY(scale * cos(angle), scale * sin(angle));
     }
+    EndShape(false);
 } // End Star().
 
 
@@ -2694,6 +2857,7 @@ void SuperStar(uint_fast16_t numNodes, uint_fast16_t size, bool outline,
         // Return to the start node.
         GotoXY(scale * cos(rotation), scale * sin(rotation));
     }
+    EndShape();
 } // End SuperStar().
 
 
@@ -2723,22 +2887,22 @@ void RandomSuperStar()
 /////////////////////////////////////////////////////////////////////////////////
 ShapeInfo RandomShapes[] =
 {
-    ShapeInfo(RandomRatios, 10),
-    ShapeInfo(RandomSpirograph, 0),
-    ShapeInfo(RandomSpirograph2, 0),
-    ShapeInfo(RandomSpirographWithSquare, 10),
-    ShapeInfo(RandomRose, 11),
-    ShapeInfo(RandomClover, 11),
-    ShapeInfo(RandomSuperStar, 25),
-    ShapeInfo(RandomCircle, 15),
-    ShapeInfo(RandomPlot, 20),
-    ShapeInfo(PolygonSeries, 10),
-    ShapeInfo(StarSeries, 10),
-    ShapeInfo(HeartSeries, 15),
-    ShapeInfo(EllipseSeries, 10),
-    ShapeInfo(RandomRatiosRing, 10),
-    ShapeInfo(RandomWipe, 30),
-    ShapeInfo(RandomLines, 50)
+    ShapeInfo("RandomRatios", RandomRatios, 10),
+    ShapeInfo("RandomSpirograph", RandomSpirograph, 0),
+    ShapeInfo("RandomSpirograph2", RandomSpirograph2, 0),
+    ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 10),
+    ShapeInfo("RandomRose", RandomRose, 11),
+    ShapeInfo("RandomClover", RandomClover, 11),
+    ShapeInfo("RandomSuperStar", RandomSuperStar, 25),
+    ShapeInfo("RandomCircle", RandomCircle, 15),
+    ShapeInfo("RandomPlot", RandomPlot, 20),
+    ShapeInfo("PolygonSeries", PolygonSeries, 10),
+    ShapeInfo("StarSeries", StarSeries, 10),
+    ShapeInfo("HeartSeries", HeartSeries, 15),
+    ShapeInfo("EllipseSeries", EllipseSeries, 10),
+    ShapeInfo("RandomRatiosRing", RandomRatiosRing, 10),
+    ShapeInfo("RandomWipe", RandomWipe, 30),
+    ShapeInfo("RandomLines", RandomLines, 50)
 }; // End RandomShapes[].
 
 
@@ -2772,7 +2936,6 @@ void GenerateRandomShape()
 
     // Increment the iteration count since we just executed something.
     ShapeIteration++;
-    EndShape();
 } // End GenerateRandomShape();
 
 
@@ -2790,6 +2953,22 @@ void ResetShapes()
         RandomShapes[i].Reset();
     }
 } // End ResetShapes().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// LogExecutionStats()
+//
+// Displays execution statistics.
+/////////////////////////////////////////////////////////////////////////////////
+void LogExecutionStats()
+{
+    // Loop[ through each shape and display its execution count.]
+    for (uint_fast16_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
+    {
+        LOG_F(LOG_ALWAYS, "%5d   %s\n",
+                RandomShapes[i].GetCount(), RandomShapes[i].GetName());
+    }
+} // End LogExecutionStats().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2840,21 +3019,13 @@ void ShapeTask(__unused void *param)
     // the start of this task which is the only task that uses random numbers.
     randomSeed(RandomSeed);
     LOG_F(LOG_ALWAYS, "Seed = %u\n", RandomSeed);
-#if 1   //%%%jmc
+
     // On startup we wipe the board and display my initials.
     // Change this as desired.  It is the power-up greeting.
     ClearFromIn();
     RotateToAngle(atan2((double)JMCPlot[0].y, (double)JMCPlot[0].x));
     PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false, "JMCPlot");
-    EndShape();
-#endif
-#if 0 //%%%jmc
-while (1)
-{
-    RandomCircle();
-    EndShape();
-}
-#endif
+
     // Loop forever since tasks must never return.
     while (1)
     {
@@ -2862,7 +3033,11 @@ while (1)
         GenerateRandomShape();
 
         // If we were aborting the previous shape, we're done now.
-        AbortShape = false;
+        if (AbortShape)
+        {
+            xQueueReset(PlannerQueueHandle);
+            AbortShape = false;
+        }
 
         // Start over with a clean board if the random seed has changed.
         if (RandomSeedChanged)
@@ -2964,6 +3139,13 @@ void setup()
     RandomSeedChanged = false;
     ResetShapes();
 
+    // Note that none of the following calls are checked for errors.  If any of
+    // them fails we should be able to detect it easily.  May want to check
+    // returns some time in the future, but it seems unnecessary for now.
+
+    // Create our planner task queue.
+    PlannerQueueHandle = xQueueCreate(PLANNER_Q_LENGTH, sizeof(PlannerData));
+
     // Create the task that handles pot updates.  It will run on core 1.
     TaskHandle_t ReadPotsHandle = NULL;
     xTaskCreate(ReadPotsTask, "ReadPots", 1024, NULL, 0, &ReadPotsHandle);
@@ -2980,9 +3162,14 @@ void setup()
     vTaskCoreAffinitySet(PrintHandle, 1 << 1);
 
     // Create the task to generatse motion.  It will run on core 0.
-    TaskHandle_t ShapeHandle = NULL;
+    TaskHandle_t  ShapeHandle = NULL;
     xTaskCreate(ShapeTask, "Path", 8192, NULL, 5, &ShapeHandle);
     vTaskCoreAffinitySet(ShapeHandle, 1 << 0);
+
+    // Create the planner which interfaces to the servo ISR's.
+    // It will run on core 0 at a high priority.
+    xTaskCreate(ServoControlTask, "Servo", 8192, NULL, 6, &ServoCtrlHandle);
+    vTaskCoreAffinitySet(ServoCtrlHandle, 1 << 0);
 
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // !!!NOTE:  MUST NOT CALL vTaskStartScheduler() OR SYSTEM WILL CRASH!!!
@@ -3015,6 +3202,8 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
+    BaseType_t taskWoken = false;
+
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
     {
@@ -3077,8 +3266,14 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
             {
                 InOutOn = false;
             }
+            if (!RotOn && !InOutOn)
+            {
+                xTaskNotifyFromISR(ServoCtrlHandle, 0, eNoAction, &taskWoken);
+            }
         }
     } // End if (RotOn && !Pausing)
+
+    portYIELD_FROM_ISR(taskWoken);
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
@@ -3094,6 +3289,8 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
+    BaseType_t taskWoken = false;
+
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
     {
@@ -3118,6 +3315,10 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             if (InOutSteps == InOutStepsTo)
             {
                 InOutOn = false;
+                if (!RotOn)
+                {
+                    xTaskNotifyFromISR(ServoCtrlHandle, 0, eNoAction, &taskWoken);
+                }
             }
             LastMRPoints = false;
         }
@@ -3154,6 +3355,8 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             }
         } // End else (MRPointCount)
     } // End if (InOutOn && !Pausing)
+
+    portYIELD_FROM_ISR(taskWoken);
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds

@@ -19,7 +19,10 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
-// - 09-APR-2025
+// - 13-JUL-2025 JMC
+//   - Fixed limit checking in in/out ISR.
+//   - Other minor repairs.
+// - 09-APR-2025 JMc
 // - Minor fix to GenerateRandomSeed().
 // - 07-APR-2025 JMC
 //   - Added a function to generate a random seed - GenerateRandomSeed().
@@ -2633,7 +2636,7 @@ void SuperStar(uint16_t numNodes, uint16_t size, bool outline, float rotation)
     LOG_U(LOG_INFO, ")\n");
 
     // If we are drawing a perimeter, then initial skip is 1.  Otherwise it is 2.
-    uint16_t initialSkip = (outline || (numNodes < 4)) ? 1 : 2;
+    uint16_t initialSkip = (outline || (numNodes <= 4)) ? 1 : 2;
 
     // Move to our start point.
     GotoXY(scale * cosf(rotation), scale * sinf(rotation));
@@ -3110,11 +3113,11 @@ ISR(TIMER1_COMPB_vect)
                     lastMRPoints = true;
                 }
                 // Adjust the direction if limits are reached.
-                if (InOutSteps > OutLimit)
+                if (InOutSteps >= OutLimit)
                 {
                     DirInOut = IN;
                 }
-                else if (InOutSteps < InLimit)
+                else if (InOutSteps <= InLimit)
                 {
                     DirInOut = OUT;
                 }
