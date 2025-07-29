@@ -21,6 +21,9 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 28-JUL-2025
+//   - Re-worked random path selection to use RandomVoseAlias class.
+//   - Fixed a couple of minor issues.
 // - 12-JUL-2025 JMC
 //   - Fixed limit checking in InOutServoIsr().
 //   - Split servo handling into separate tasks for planning and servo controlling.
@@ -70,6 +73,7 @@
 #include <FreeRTOS.h>           // For FreeRTOS core.
 #include "SerialLogFreeRTOS.h"  // For data logging macro (LOG_F).
 #include "STStepper.pio.h"      // For STStepper class and stepper PIO state machine.
+#include "RandomVoseAlias.h"    // For RandomVoseAlias (weighted random number) class.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -107,7 +111,10 @@ const int LIGHTS_PIN         = 11;          // Lights (LEDs) outpuut pin.
 const int PAUSE_LED_PIN      = PIN_LED;     // Pause LED lights red when paused.
 const int BRIGHTNESS_POT_PIN = A0;          // Brightness pot pin.
 const int SPEED_POT_PIN      = A1;          // Speed pot pin.
-const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.
+const int ROT_HOME_PIN       = 5;           // Home reed switch input pin.  If
+                                            // USE_HOME_SENSOR is false, then this
+                                            // pin is ignored and can be set to
+                                            // any value.
 
 // Hardware related constants.
 const int_fast32_t  MICROSTEPS        = 64;     // Microsteps used by servos.
@@ -295,13 +302,20 @@ volatile uint_fast8_t LastInOutDir = DirInOut;
 volatile uint_fast16_t LastMRPoints = 0;
 
 
-// Planner related variables.
+// RTOS related variables.
 TaskHandle_t      ServoCtrlHandle    = NULL;    // Handle for servo control task.
+TaskHandle_t      ShapeHandle        = NULL;    // Handle for shape task.
 QueueHandle_t     PlannerQueueHandle = 0;       // Handle for planner queue.
 const UBaseType_t PLANNER_Q_LENGTH   = 10;      // Num entries in planner queue.
 volatile double   PlannerCurrentX    = 0.0;     // Planned location of ball (X).
 volatile double   PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
 volatile bool     MoveInProcess      = false;   // True if moves are in process.
+
+// Create a weighted random object for use in selecting the next shape to execute.
+RandomVoseAlias WeightedRandom;
+// Vector of weighted probabilities used with WeightedRandom.
+std::vector<double> Probabilities;
+
 
 // PlannerData structure.  Used to pass data between the planner and the
 // servo controller task.
@@ -319,8 +333,8 @@ void    MotorRatios(double ratio, bool multiplePoints,
                  int_fast16_t inLimit = 0, int_fast16_t outLimit = MAX_SCALE_I);
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data);
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data);
-void EndShape(bool delay = true);
-void LogExecutionStats();
+void    EndShape(bool delay = true);
+void    LogExecutionStats();
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -379,17 +393,20 @@ public:
     // external use.
     //
     // Arguments:
+    //   - pName  : This is a pointer to a string representing the name of the shape.
     //   - pShape : This is a pointer to the function that will generate a shape.
     //              The function has no arguments and returns nothing.
-    //   - delay  : The number of execution cycles that must elapse between
-    //              executions of *pShape().
+    //   - weight : The weight of this object.  Used to generate a weighted
+    //              probabilities vector which is used to randomly select shapes
+    //              for execution.  A higher value causes the shape to be
+    //              selected more frequently.
     /////////////////////////////////////////////////////////////////////////////
-    ShapeInfo(const char *pName, void (*pShape)(), uint_fast16_t delay)
+    ShapeInfo(const char *pName, void (*pShape)(), uint_fast16_t weight)
     {
         // Initialize our data based on our arguments.
         m_pName     = pName;
         m_pShape    = pShape;
-        m_Delay     = delay;
+        m_Weight    = weight;
         m_LastCycle = 0;
         m_Count     = 0;
     } // End constructor.
@@ -398,31 +415,19 @@ public:
     /////////////////////////////////////////////////////////////////////////////
     // MakeShape()
     //
-    // This method enforces the delay between consecutive executions of pShape().
+    // This method executes the shape associated with this instance.
     //
     // Arguments:
     //   - cycle : This is the current cycle (iteration) of shape generation
     //             It is incremented by the caller each time a shape is
     //             generated.
     /////////////////////////////////////////////////////////////////////////////
-    bool MakeShape(uint_fast16_t cycle)
+    void MakeShape(uint_fast16_t cycle)
     {
-        // Assume we're going to fail.
-        bool retval = false;
-
-        // Have enough iterations passed since our last execution?
-        if (cycle - m_LastCycle >= m_Delay)
-        {
-            // Yes, it's ok to make our shape.  Do it!
-            m_Count++;
-            (*m_pShape)();
-
-            // Remember that we just executed.
-            m_LastCycle = cycle;
-            retval = true;
-        }
-        // Let the caller know if we executed or not.
-        return retval;
+        // Make our shape and bump our usage count.
+        m_Count++;
+        m_LastCycle = cycle;
+        (*m_pShape)();
     } // End MakeShape().
 
 
@@ -445,10 +450,7 @@ public:
     //
     // Returns the usage count.
     /////////////////////////////////////////////////////////////////////////////
-    uint_fast32_t GetCount()
-    {
-        return m_Count;
-    } // End GetCount().
+    uint_fast32_t GetCount() { return m_Count; }
 
 
     /////////////////////////////////////////////////////////////////////////////
@@ -456,10 +458,14 @@ public:
     //
     // Returns the usage count.
     /////////////////////////////////////////////////////////////////////////////
-    const char *GetName()
-    {
-        return m_pName;
-    } // End GetName().
+    const char *GetName() { return m_pName; }
+
+    /////////////////////////////////////////////////////////////////////////////
+    // GetWeight()
+    //
+    // Returns the randomization weight.
+    /////////////////////////////////////////////////////////////////////////////
+    uint_fast16_t GetWeight() { return m_Weight; }
 
 
 private:
@@ -469,9 +475,10 @@ private:
 
     const char   *m_pName;       // Name string.
     void         (*m_pShape)();  // Pointer to function to execute if not too soon.
-    uint_fast16_t m_Delay;       // Number of iterations between consecutive executions.
+    uint_fast16_t m_Weight;      // Randomization weigh of this instance.  Higher
+                                 // values cause more frequent execution.
     uint_fast16_t m_LastCycle;   // Iteration that we last executed.
-    uint_fast32_t m_Count;       // Count of number of times executed.
+    uint_fast32_t m_Count;       // Count of number of times we executed.
 }; // End class ShapeInfo.
 
 
@@ -596,8 +603,12 @@ void HandleRemoteCommandsTask(__unused void *param)
     // Setup a buffer to hold any received commands.
     const uint_fast16_t BUFLEN = MAX_LOG_STRING_SIZE;
     char buf[BUFLEN];
+
+    // Some constants used for handling remote commands.
     const char *HELLO_STRING = "Hello Sand Table!";
     const char *RESPONSE_STRING = "Hello Remote!\n";
+    const int_fast16_t REMOTE_SPEED_INCREMENT = 40;
+    const int_fast16_t REMOTE_BRIGHTNESS_INCREMENT = 2;
 
     // Delay before starting the task to give the print task time to start up.
     vTaskDelay(pdMS_TO_TICKS(3000));
@@ -632,29 +643,33 @@ void HandleRemoteCommandsTask(__unused void *param)
             // Handle the remote command.
             switch (toupper(buf[0]))
             {
-                // Increase speed.
+                // Increase speed and limit.
                 case 'F':
                     RemoteSpeedDelay = true;
-                    SpeedDelay -= 40;
+                    SpeedDelay = constrain(SpeedDelay - REMOTE_SPEED_INCREMENT,
+                                           SPEED_DELAY_MIN_VAL, SPEED_DELAY_MAX_VAL);
                 break;
-                // Decrease speed.
+                // Decrease speed and limit.
                 case 'S':
                     RemoteSpeedDelay = true;
-                    SpeedDelay += 40;
+                    SpeedDelay = constrain(SpeedDelay + REMOTE_SPEED_INCREMENT,
+                                           SPEED_DELAY_MIN_VAL, SPEED_DELAY_MAX_VAL);
                 break;
                 // Restore local control of speed;
                 case 'Q':
                     RemoteSpeedDelay = false;
                 break;
-                // Increase brightness.
+                // Increase brightness and limit.
                 case 'B':
                     RemoteBrightness = true;
-                    Brightness += 2;
+                    Brightness = constrain(Brightness + REMOTE_BRIGHTNESS_INCREMENT,
+                                           BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
                 break;
-                // Decrease brightness.
+                // Decrease brightness and limit.
                 case 'D':
                     RemoteBrightness = true;
-                    Brightness -= 2;
+                    Brightness = constrain(Brightness - REMOTE_BRIGHTNESS_INCREMENT,
+                                           BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
                 break;
                 // Restore local control of brightness.
                 case 'L':
@@ -715,7 +730,7 @@ void HandleRemoteCommandsTask(__unused void *param)
                 break;
                 // Show execution statistics.
                 case 'E':
-                LogExecutionStats();
+                    LogExecutionStats();
                 break;
                 // Step to next shape array segment.
                 case '+':
@@ -729,14 +744,12 @@ void HandleRemoteCommandsTask(__unused void *param)
                 default:
                 break;
             }
-            // Make sure that our speed and brightness values remain valid.
-            SpeedDelay = constrain(SpeedDelay, SPEED_DELAY_MIN_VAL, SPEED_DELAY_MAX_VAL);
-            Brightness = constrain(Brightness, BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
         }
         // Waste some time.
         vTaskDelay(pdMS_TO_TICKS(5));
     } // End while (1)  Tasks never return.
 } // End HandleRemoteCommandsTask().
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // RandomBool()
@@ -851,7 +864,7 @@ uint_fast16_t LCM(uint_fast16_t a, uint_fast16_t b)
 /////////////////////////////////////////////////////////////////////////////////
 // Reduce()
 //
-// Returns the input values reduced by their greatest common divisor (gcd).
+// Returns the input values reduced by their greatest common divisor (GCD).
 //
 // Arguments:
 //  a - The first unsigned 16-bit value.
@@ -894,7 +907,7 @@ void CalculateXY()
 //
 // Arguments:
 //   - steps     : The number of motor steps to go IN or OUT.  We limit this to
-//                 values between 0 and INOUT_TOTAL_STEPS + 10 in order to
+//                 values between 0 and INOUT_TOTAL_STEPS + 2 in order to
 //                 protect the in/out hardware.
 //   - direction : The direction (IN or OUT) to move the axis.
 //   - delay     : The delay, in microseconds, to add between motor step toggles.
@@ -904,7 +917,7 @@ void CalculateXY()
 void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 {
     // Limit our arguments.
-    steps = min(steps, INOUT_TOTAL_STEPS + 10);
+    steps = min(steps, INOUT_TOTAL_STEPS + 2);
     delay = constrain(delay, MIN_FORCE_DELAY, MAX_FORCE_DELAY);
 
     // Enable the stepper motor.
@@ -931,7 +944,6 @@ void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 // This function steps the rotary axis CW or CCW without coordinating with the
 // rest of the system.  It is mainly used during homing to search for the rotary
 // home sensor and should not normally be called by shape generation code.
-//
 //
 // Arguments:
 //   - steps     : The number of motor steps to go CW or CCW.
@@ -988,11 +1000,11 @@ void Home()
         RotOn = false;
         InOutOn = false;
 
-        // Move the inout axis first, all the way out.
+        // Move the in/out axis first, all the way out.
         DirInOut = OUT;
         ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY);
 
-        // Disable inout to eliminate clicking on CW move.
+        // Disable in/out to eliminate clicking on CW move.
         DisableInOut();
 
         // If already on the home position, rotate  CCW till we're past it.
@@ -1083,8 +1095,8 @@ void ExtendInOut()
 /////////////////////////////////////////////////////////////////////////////////
 void RotateToAngle(double angle)
 {
-    // atan2() returns the angle in radians in the range -pi to pi.  Convert
-    // negative angle to positive.
+    // angle is in radians in the range -pi to pi.  Convert any negative angle to
+    // positive.
     angle += (angle < 0.0) ? PI_X_2 : 0.0;
 
     // Calculate the rotation steps and limit as needed.
@@ -1126,7 +1138,7 @@ inline bool IsRotHome()  { return !digitalRead(ROT_HOME_PIN); }
 /////////////////////////////////////////////////////////////////////////////////
 // ReverseKinematics()
 //
-// This function calculates the necessary values of RotStepsTo and InOutStepsTo
+// This function calculates the corresponding values of RotStepsTo and InOutStepsTo
 // given the (X, Y) coordinates of the target position (i.e. it performs a
 // reverse kinematics operation).  RotStepsTo and InOutStepsTo are in motor
 // counts from zero, and are used by the motor driver ISRs to position the
@@ -1165,8 +1177,9 @@ void ReverseKinematics(double newX, double newY)
      newPosData.m_InOutStepsTo = round((rTo * INOUT_TOTAL_STEPS) / MAX_SCALE_F);
      newPosData.m_InOutStepsTo = constrain(newPosData.m_InOutStepsTo, 0, INOUT_TOTAL_STEPS);
 
-    // Queue data to servo control task.  Note that when an abort shape is
-    // commanded, this queue will be reset, so we can wait infinitely here.
+    // Queue the new position data to the servo control task.  Note that when an
+    // abort shape is commanded, this queue will be reset, so we can wait infinitely
+    // here.
     xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(9999999));
 
 } // End ReverseKinematics().
@@ -1176,7 +1189,7 @@ void ReverseKinematics(double newX, double newY)
 // WaitForMoveComplete()
 //
 // Waits for all queued motion to complete.  Returns an indication of whether
-// or not too much time occurred with motion still queued.  On timeout,
+// or not too much time has occurred with motion still queued.  On timeout,
 // it tries to correct the problem by resetting the motion queue and signaling
 // the servo control task.
 //
@@ -1208,7 +1221,10 @@ bool WaitForMoveComplete()
         xQueueReset(PlannerQueueHandle);
         xTaskNotify(ServoCtrlHandle, 0, eNoAction);
         moveComplete = false;
-        LOG_F(LOG_INFO, "WaitForMoveComplete() timed out.\n");
+        if (!timeLeftMs)
+        {
+            LOG_F(LOG_INFO, "WaitForMoveComplete() timed out.\n");
+        }
     }
 
     return moveComplete;
@@ -1234,6 +1250,9 @@ void ServoControlTask(__unused void *param)
         MoveInProcess = false;
         if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)))
         {
+            // We don't need to protect the following code since both interrupts
+            // are currently disabled via InOutOn and RotOn both being false at
+            // this point.
             MoveInProcess = true;
             InOutStepsTo = data.m_InOutStepsTo;
             RotStepsTo   = data.m_RotStepsTo;
@@ -1268,6 +1287,7 @@ void ServoControlTask(__unused void *param)
                 }
             }
 
+            // Now start the move if either axis needs to move.
             if (bRotON || bInOutON)
             {
                 // Make sure we start with the servo complete flag inactive.
@@ -1280,7 +1300,8 @@ void ServoControlTask(__unused void *param)
                 taskEXIT_CRITICAL();
 
                 // Wait until the target is reached or an abort is commanded.
-                while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) && !AbortShape)
+                while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) &&
+                       !AbortShape)
                 {
                     // Do nothing.
                 }
@@ -1344,7 +1365,6 @@ void GotoXY(double targetX, double targetY)
         PlannerCurrentX = newX;
         PlannerCurrentY = newY;
         CalculateXY();
-
     }
 } // End GotoXY().
 
@@ -1599,7 +1619,7 @@ void EndShape(bool delay)
 void EndSeries()
 {
     LOG_F(LOG_INFO, "End Series\n");
-    
+
     // Delay a bit.
      vTaskDelay(pdMS_TO_TICKS(3000));
 } // End EndSeries().
@@ -1758,7 +1778,7 @@ void ClearFromIn(double = 0.0)
     // Do the wipe.
     MotorRatios(WIPE_RATIO, false);
 
-    EndShape();
+    EndShape(false);
 } // End ClearFromIn().
 
 
@@ -1779,7 +1799,7 @@ void ClearFromOut(double = 0.0)
 
     MotorRatios(WIPE_RATIO, false);
 
-    EndShape();
+    EndShape(false);
 } // End ClearFromOut().
 
 
@@ -2109,6 +2129,9 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
         DirRot = ROT_CAUSING_IN;
     }
 
+    // Make sure we start with the move complete flag inactive.
+    xTaskNotifyStateClear(ServoCtrlHandle);
+
     // Start the move by turning the motors on atomically.
     taskENTER_CRITICAL();
     RotOn   = true;
@@ -2117,7 +2140,7 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
     // MRPointCount equals 0;
-    while ((RotOn || InOutOn) && !AbortShape)
+    while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(500)) != pdTRUE) && !AbortShape)
     {
         CalculateXY();       // Keep track of the location as it moves.
         Display();
@@ -2883,27 +2906,62 @@ void RandomSuperStar()
 // RandomShapes[]
 //
 // This is an array of ShapeInfo instances which is used to select random shapes
-// to be displayed.
+// to be displayed.  The weight value of each entry is based on how frequently
+// each shape should execute based on how often a random wipe is executed.
+// For example:
+//      - RandomPlot should execute 5 times as frequently as RandomWipe.
+//      - RandomSuperStar should execute 10 times as frequently as RandomWipe.
+//      - ...
 /////////////////////////////////////////////////////////////////////////////////
 ShapeInfo RandomShapes[] =
 {
-    ShapeInfo("RandomRatios", RandomRatios, 10),
-    ShapeInfo("RandomSpirograph", RandomSpirograph, 0),
-    ShapeInfo("RandomSpirograph2", RandomSpirograph2, 0),
-    ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 10),
-    ShapeInfo("RandomRose", RandomRose, 11),
-    ShapeInfo("RandomClover", RandomClover, 11),
-    ShapeInfo("RandomSuperStar", RandomSuperStar, 25),
-    ShapeInfo("RandomCircle", RandomCircle, 15),
-    ShapeInfo("RandomPlot", RandomPlot, 20),
-    ShapeInfo("PolygonSeries", PolygonSeries, 10),
-    ShapeInfo("StarSeries", StarSeries, 10),
+    ShapeInfo("RandomWipe", RandomWipe, 1),
+    ShapeInfo("RandomPlot", RandomPlot, 5),
+    ShapeInfo("RandomSuperStar", RandomSuperStar, 10),
+    ShapeInfo("RandomLines", RandomLines, 10),
+    ShapeInfo("RandomCircle", RandomCircle, 12),
     ShapeInfo("HeartSeries", HeartSeries, 15),
-    ShapeInfo("EllipseSeries", EllipseSeries, 10),
-    ShapeInfo("RandomRatiosRing", RandomRatiosRing, 10),
-    ShapeInfo("RandomWipe", RandomWipe, 30),
-    ShapeInfo("RandomLines", RandomLines, 50)
+    ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 20),
+    ShapeInfo("RandomSpirograph2", RandomSpirograph2, 25),
+    ShapeInfo("RandomRose", RandomRose, 25),
+    ShapeInfo("RandomClover", RandomClover, 25),
+    ShapeInfo("RandomRatios", RandomRatios, 30),
+    ShapeInfo("RandomSpirograph", RandomSpirograph, 30),
+    ShapeInfo("PolygonSeries", PolygonSeries, 30),
+    ShapeInfo("StarSeries", StarSeries, 30),
+    ShapeInfo("EllipseSeries", EllipseSeries, 30),
+    ShapeInfo("RandomRatiosRing", RandomRatiosRing, 30)
 }; // End RandomShapes[].
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// InitProbabilities()
+//
+// Steps through the RandomShapes weights and creates a vector with corresponding
+// probabilities.
+/////////////////////////////////////////////////////////////////////////////////
+void InitProbabilities()
+{
+    // Resize our probabilities vector to match the RandomShapes size.
+    Probabilities.resize(sizeof(RandomShapes) / sizeof(RandomShapes[0]));
+    double total = 0.0;
+
+    // Total the weights of each shape in RandomShapes.
+    for (size_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]);  i++)
+    {
+        total += (double)RandomShapes[i].GetWeight();
+    }
+
+    // Convert the weight of each shape to a corresponding probability value.
+    for (size_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]);  i++)
+    {
+        Probabilities[i] = (double)RandomShapes[i].GetWeight() / total;
+    }
+
+    // Now that the probability vector has been filled in, initialize the
+    // weighted random number generator.
+    WeightedRandom.Init(Probabilities);
+} // End InitProbabilities().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2911,28 +2969,13 @@ ShapeInfo RandomShapes[] =
 //
 // Randomly selects a randomization function to execute.  The RandomShapes array
 // contains a list of ShapeInfo instances that contain a pointer to a randomization
-// function and its corresponding skip value.  It calls the corresponding
-// ShapeInfo.MakeShape() method which determines whether or not it is ok to
-// execute the corresponding randomization function based on the current iteration
-// value.  If the shape function executes then MakeShape() returns a value
-// of 'true'.  In this case, GenerateRandomShape() increments the iteration count.
-// If the shape function does not execute, and returns 'false', the iteration
-// count is not incremented, and another random shape is considered.
+// function and its corresponding weight value.  It calls the corresponding
+// ShapeInfo.MakeShape() method to generate the shape.
 /////////////////////////////////////////////////////////////////////////////////
 void GenerateRandomShape()
 {
-    // Keep track of our iteration.
-    size_t index = 0;
-
-    // Select functions to execute at random till we find one that will actually
-    // execute.
-    do
-    {
-        // Select a random function to execute.
-        index = random(0, sizeof(RandomShapes) / sizeof(RandomShapes[0]));
-
-    // Call the random function, and try another function if it was too soon.
-    } while (!RandomShapes[index].MakeShape(ShapeIteration));
+    // Execute a random shape.
+    RandomShapes[WeightedRandom.Next()].MakeShape(ShapeIteration);
 
     // Increment the iteration count since we just executed something.
     ShapeIteration++;
@@ -2962,12 +3005,19 @@ void ResetShapes()
 /////////////////////////////////////////////////////////////////////////////////
 void LogExecutionStats()
 {
-    // Loop[ through each shape and display its execution count.]
+    uint_fast32_t total = 0;
+    uint_fast32_t count = 0;
+
+    // Loop through each shape and display its execution count.
     for (uint_fast16_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
     {
-        LOG_F(LOG_ALWAYS, "%5d   %s\n",
-                RandomShapes[i].GetCount(), RandomShapes[i].GetName());
+        count = RandomShapes[i].GetCount();
+        total += count;
+        LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n", 
+              count, Probabilities[i], RandomShapes[i].GetName());
     }
+    // Display the total number of shapes that have been produced.
+    LOG_F(LOG_ALWAYS, "%5d   TOTAL\n", total);
 } // End LogExecutionStats().
 
 
@@ -3139,6 +3189,10 @@ void setup()
     RandomSeedChanged = false;
     ResetShapes();
 
+    // Initialize our weighted random object with probabilities specified in
+    // the RandomShapes[] array.
+    InitProbabilities();
+
     // Note that none of the following calls are checked for errors.  If any of
     // them fails we should be able to detect it easily.  May want to check
     // returns some time in the future, but it seems unnecessary for now.
@@ -3162,7 +3216,6 @@ void setup()
     vTaskCoreAffinitySet(PrintHandle, 1 << 1);
 
     // Create the task to generatse motion.  It will run on core 0.
-    TaskHandle_t  ShapeHandle = NULL;
     xTaskCreate(ShapeTask, "Path", 8192, NULL, 5, &ShapeHandle);
     vTaskCoreAffinitySet(ShapeHandle, 1 << 0);
 
@@ -3342,13 +3395,15 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             }
 
             // If we're creating multiple points and the direction has changed,
-            // deccrement the points count.
+            // deccrement the points count and notify the shape task that we're
+            //done.
             if (LastInOutDir != DirInOut)
             {
                 if (--MRPointCount == 0)
                 {
                     RotOn   = false;
                     InOutOn = false;
+                    xTaskNotifyFromISR(ShapeHandle, 0, eNoAction, &taskWoken);
                 }
                 // Remember the current in/out direction for next time.
                 LastInOutDir = DirInOut;
