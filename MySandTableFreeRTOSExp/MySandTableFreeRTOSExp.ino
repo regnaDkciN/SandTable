@@ -21,6 +21,9 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 30-JUL-2025
+//   - Fixed some very subtle planner and ISR issues.
+//   - Increased STEPS_PER_UNIT and PLANNER_Q_LENGTH for smoother (quieter) operation.
 // - 28-JUL-2025
 //   - Re-worked random path selection to use RandomVoseAlias class.
 //   - Fixed a couple of minor issues.
@@ -127,7 +130,7 @@ const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to
 const double       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
 const uint_fast32_t MAX_SCALE_I       = (uint_fast32_t)MAX_SCALE_F;
                                                 // Maximum X or Y coordinate value.
-const double       STEPS_PER_UNIT    = 1.0;    // Higher values produce smoother moves
+const double       STEPS_PER_UNIT    = 10.0;    // Higher values produce smoother moves
                                                 // Good values range from 1.0 to 10.0.
 const uint_fast32_t HOME_ROT_OFFSET   = 353 * (ROT_TOTAL_STEPS / 1000);
                                                 // The rotational offset to be applied
@@ -254,8 +257,8 @@ volatile bool         RotOn        = false;  // 'true' if rotary axis is moving.
 volatile bool         InOutOn      = false;  // 'true' if inout axis is moving.
 volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
 volatile uint_fast8_t DirRot       = CW;     // Current Rotary direction.
-int_fast16_t          InOutDelay   = 400;    // ISR delay for In/Out motor (uSec).
-int_fast16_t          RotDelay     = 400;    // ISR delay for Rotary motor (uSec).
+int64_t               InOutDelay   = 400;    // ISR delay for In/Out motor (uSec).
+int64_t               RotDelay     = 400;    // ISR delay for Rotary motor (uSec).
 uint_fast32_t         RandomSeed   = 0;      // RNG seed used at startup.
 volatile uint_fast16_t MRPointCount = 0;     // Count of the number of points displayed.
 double               RotSpeedFactor= 1.0;   // Multiplicative factor for rotational speed.
@@ -265,7 +268,7 @@ volatile int_fast16_t InLimit      = 0;      // Inner in/out limit where MotorRa
                                              // will change direction or finish.
 volatile int_fast16_t OutLimit     = MAX_SCALE_I; // Outer in/out limit where MotorRatios()
                                              // will change direction or finish.
-         int_fast16_t SpeedDelay   = SPEED_DELAY_MAX_VAL;
+         int64_t      SpeedDelay   = SPEED_DELAY_MAX_VAL;
                                              // Active speed delay value.
 bool                  RemoteSpeedDelay = false; // 'true' if remotely setting speed.
 int_fast16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
@@ -299,14 +302,17 @@ volatile int_fast16_t InOutCompAccum = 0;
 volatile uint_fast8_t LastInOutDir = DirInOut;
 
 // Used to determine first time use of multiple points.
-volatile uint_fast16_t LastMRPoints = 0;
+volatile bool LastMRPoints = false;
+
+// True when ShapeTask initialization is done.
+volatile bool GeneratingShapes = false;
 
 
 // RTOS related variables.
 TaskHandle_t      ServoCtrlHandle    = NULL;    // Handle for servo control task.
 TaskHandle_t      ShapeHandle        = NULL;    // Handle for shape task.
 QueueHandle_t     PlannerQueueHandle = 0;       // Handle for planner queue.
-const UBaseType_t PLANNER_Q_LENGTH   = 10;      // Num entries in planner queue.
+const UBaseType_t PLANNER_Q_LENGTH   = 20;      // Num entries in planner queue.
 volatile double   PlannerCurrentX    = 0.0;     // Planned location of ball (X).
 volatile double   PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
 volatile bool     MoveInProcess      = false;   // True if moves are in process.
@@ -685,20 +691,29 @@ void HandleRemoteCommandsTask(__unused void *param)
                 break;
                 // Re-start with a new random seed.
                 case 'R':
-                    // Read the new seed value.
-                    char *endptr;   // Unused, but needed for strtoul().
-                    RandomSeed = strtoul(buf + 1, &endptr, 10);
-                    taskENTER_CRITICAL();
-                    // Reset the random  number generator with the new seed value.
-                    randomSeed(RandomSeed);
-                    // Let everyone know we changed the random seed.
-                    RandomSeedChanged = true;
-                    // Abort the current shape since we want the new random value to
-                    // take effect at the beginning of a shape.
-                    AbortShape = true;
-                    // Make sure to empty our planner queue.
-                    xQueueReset(PlannerQueueHandle);
-                    taskEXIT_CRITICAL();
+                    // We don't want to re-start during initialization.
+                    if (GeneratingShapes)
+                    {
+                        // Read the new seed value.
+                        char *endptr;   // Unused, but needed for strtoul().
+                        RandomSeed = strtoul(buf + 1, &endptr, 10);
+                        taskENTER_CRITICAL();
+                        // Reset the random  number generator with the new seed value.
+                        randomSeed(RandomSeed);
+                        // Let everyone know we changed the random seed.
+                        RandomSeedChanged = true;
+                        // Abort the current shape since we want the new random value to
+                        // take effect at the beginning of a shape.
+                        AbortShape = true;
+                        // Make sure to empty our planner queue.
+                        xQueueReset(PlannerQueueHandle);
+                        taskEXIT_CRITICAL();
+                    }
+                    else
+                    {
+                        // We can't reset now.
+                        LOG_F(LOG_ALWAYS, "Try again after init completes.\n");
+                    }
                     [[fallthrough]];
                 // Get the (possibly) new random seed.
                 // Note that the 'R' case falls through to this case.
@@ -1047,7 +1062,7 @@ void Home()
     InLimit         = 0;
     OutLimit        = MAX_SCALE_I;
     InOutCompAccum  = 0;
-    LastMRPoints    = 0;
+    LastMRPoints    = false;
     LastInOutDir    = DirInOut;
 
     EndShape(false);
@@ -1290,7 +1305,7 @@ void ServoControlTask(__unused void *param)
             // Now start the move if either axis needs to move.
             if (bRotON || bInOutON)
             {
-                // Make sure we start with the servo complete flag inactive.
+               // Make sure we start with the servo complete flag inactive.
                 xTaskNotifyStateClear(ServoCtrlHandle);
 
                 // Start the move atomically.
@@ -1570,6 +1585,9 @@ void StartShape(const char *pFmt, ...)
         vsnprintf(CurrentShapeString, MAX_LOG_STRING_SIZE, pFmt, args);
         LOG_F(LOG_INFO, CurrentShapeString);
     }
+
+    // Update our planner position.
+    CalculateXY();
     PlannerCurrentX = CurrentX;
     PlannerCurrentY = CurrentY;
 } // End StartShape().
@@ -1601,6 +1619,11 @@ void EndShape(bool delay)
 
     // Wait for shape to complete.
     WaitForMoveComplete();
+
+    // Update our planner position.
+    CalculateXY();
+    PlannerCurrentX = CurrentX;
+    PlannerCurrentY = CurrentY;
 
     // Delay a bit if requested.
     if (delay)
@@ -2128,6 +2151,7 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
         DirInOut = OUT;
         DirRot = ROT_CAUSING_IN;
     }
+    LastInOutDir = DirInOut;
 
     // Make sure we start with the move complete flag inactive.
     xTaskNotifyStateClear(ServoCtrlHandle);
@@ -2148,11 +2172,11 @@ void MotorRatios(double ratio, bool multiplePoints, int_fast16_t inLimit,
         // If LOG_CYCLES is 'false' then this entire block wiil be optimized out.
         if (LOG_CYCLES)
         {
-            static uint_fast16_t LastMRPoints = 0;
-            if (MRPointCount && (LastMRPoints != MRPointCount))
+            static uint_fast16_t localLastMRPoints = 0;
+            if (MRPointCount && (localLastMRPoints != MRPointCount))
             {
                 LOG_F(LOG_CYCLES,"%d\n", MRPointCount);
-                LastMRPoints = MRPointCount;
+                localLastMRPoints = MRPointCount;
             }
         }
     }
@@ -3013,7 +3037,7 @@ void LogExecutionStats()
     {
         count = RandomShapes[i].GetCount();
         total += count;
-        LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n", 
+        LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n",
               count, Probabilities[i], RandomShapes[i].GetName());
     }
     // Display the total number of shapes that have been produced.
@@ -3075,6 +3099,9 @@ void ShapeTask(__unused void *param)
     ClearFromIn();
     RotateToAngle(atan2((double)JMCPlot[0].y, (double)JMCPlot[0].x));
     PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false, "JMCPlot");
+
+    // Inform the rest that we're uup and running.
+    GeneratingShapes = true;
 
     // Loop forever since tasks must never return.
     while (1)
@@ -3166,8 +3193,8 @@ void setup()
     while (ReadAPot(SPEED_POT_PIN) <= KNOB_MIN_VAL + 16) { /* Do nothing.*/ }
 
     // Create an alarm for the rotational and in/out servo ISRs.  Start in 1 second.
-    add_alarm_in_us(1000000, RotaryServoIsr, NULL, false);
-    add_alarm_in_us(1000000, InOutServoIsr,  NULL, false);
+    add_alarm_in_us(1000000, RotaryServoIsr, NULL, true);
+    add_alarm_in_us(1000000, InOutServoIsr,  NULL, true);
 
     // Seed the random number generator.
     RandomSeed = get_rand_32();
@@ -3187,6 +3214,7 @@ void setup()
     AbortShape        = false;
     ShapeIteration    = 0;
     RandomSeedChanged = false;
+    GeneratingShapes  = false;
     ResetShapes();
 
     // Initialize our weighted random object with probabilities specified in
@@ -3251,7 +3279,9 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 // RotaryServoIsr()
 //
-// This is the ISR for the rotational motor.
+// This is the ISR for the rotational motor.  This is actually an alarm callback.
+// See FreeRTOS add_alarm_in_us() documentation.  It executes in the context
+// of an ISR, so ISR functions are needed.
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
@@ -3338,7 +3368,9 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 // InOutServoIsr()
 //
-// This is the ISR for the in/out motor.
+// This is the ISR for the in/out motor.  This is actually an alarm callback.
+// See FreeRTOS add_alarm_in_us() documentation.  It executes in the context
+// of an ISR, so ISR functions are needed.
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
