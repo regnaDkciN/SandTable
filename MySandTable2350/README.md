@@ -211,6 +211,8 @@ This was necessitated due to the UNO ```sprintf()` function not supporting float
 
 
 ### Temporarily Handle Compiler Floating Point Issue
+**NOTE:  As of 02-AUG-2025 this issue has been fixed on all RP2350 versions of the sand table software.  This requires version 4.6.1 or later of the Raspberry Pi Pico/RP2040/RP2350 API by Earle F. Philhower, III.**
+
 I initially spent about an hour trying to find out why certain shape paths were not being generated correctly in my first try of the RP2350 code.  I eventually discovered that some floating point trig operations were sometime returning incorrect values.  After a web search, I came across the [RP2350 FPU compiler issue #2429](https://github.com/raspberrypi/pico-sdk/pull/2429).  It looks like this issue has been fixed on a development branch, but has not been released to production code yet.  Until it is fixed, my workaround is to change all floats to doubles, and change all float function calls to their double equivalent.  This naturally makes the code execution slower, so I will undo these changes once a good version of the compiler is released.  Here are the changes that will be needed:
 
 | Double Function | Float Function |
