@@ -2,7 +2,7 @@ Upgrading from Arduino UNO to Adafruit Metro RP2350 (A Case Study)
 ===
 ![Headline](https://i.imgur.com/OjllJqS.jpeg)
 
-This Instructable describes the code and hardware changes that were needed to migrate a non-trivial Arduino UNO application to the Adafruit Metro RP2350 board.  Most readers will be familiar with the Arduino UNO, so it will not be described here.  The Adafruit Metro RP2350 is very close to a drop-in replacement for the Arduino UNO, but with a few differences that need to be accounted for.
+This document describes the code and hardware changes that were needed to migrate a non-trivial Arduino UNO application to the Adafruit Metro RP2350 board.  Most readers will be familiar with the Arduino UNO, so it will not be described here.  The Adafruit Metro RP2350 is very close to a drop-in replacement for the Arduino UNO, but with a few differences that need to be accounted for.
 
 The Adafruit Metro RP2350 is a tremendous improvement in processor speed and memory size over the Arduino UNO.  Here is a comparison of some of the more important features of each board:
 

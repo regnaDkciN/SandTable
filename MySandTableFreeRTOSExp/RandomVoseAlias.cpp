@@ -25,7 +25,7 @@
  *
  * @param probabilities The list of probabilities.
  ***************************************************************************/
-bool RandomVoseAlias::Init(const std::vector<double>& probabilities)
+bool RandomVoseAlias::Init(const std::vector<float_t>& probabilities)
 {
     /* Begin by doing basic structural checks on the inputs. */
     if (probabilities.empty())
@@ -36,12 +36,12 @@ bool RandomVoseAlias::Init(const std::vector<double>& probabilities)
     /* Allocate space for the m_Probability and m_Alias tables. */
     this->m_Probability.resize(probabilities.size());
     this->m_Alias.resize(probabilities.size());
-    
+
     /* Make a copy of the probabilities table so that we can modify it as needed., */
-    std::vector<double> probabilitiesCopy(probabilities);
+    std::vector<float_t> probabilitiesCopy(probabilities);
 
     /* Compute the average m_Probability and cache it for later use. */
-    const double average = 1.0 / probabilities.size();
+    const float_t average = 1.0 / probabilities.size();
 
     /* Create two deques to act as worklists as we populate the tables. */
     std::deque<int> small;
@@ -101,7 +101,7 @@ bool RandomVoseAlias::Init(const std::vector<double>& probabilities)
         m_Probability[large.back()] = 1.0;
         large.pop_back();
     }
-    
+
     m_InitDone = true;
     return true;
 } // End constructor.
@@ -116,18 +116,18 @@ int RandomVoseAlias::Next()
 {
     const int32_t PROBABILITY_RESOLUTION = 100000;
 
-    // Make sure we don't try to generate a random value if we haven't been 
+    // Make sure we don't try to generate a random value if we haven't been
     // initialized yet.
     if (!m_InitDone)
     {
         return 0;
     }
-    
+
     /* Generate a fair die roll to determine which column to inspect. */
     int column = random(0, m_Probability.size());
 
     /* Generate a biased coin toss to determine which option to pick. */
-    double rnd = (double)random(0, PROBABILITY_RESOLUTION) / (double)PROBABILITY_RESOLUTION;
+    float_t rnd = (float_t)random(0, PROBABILITY_RESOLUTION) / (float_t)PROBABILITY_RESOLUTION;
     bool coinToss = rnd < m_Probability[column];
 
     /* Based on the outcome, return either the column or its m_Alias. */

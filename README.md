@@ -6,14 +6,18 @@ My background is in real time embedded firmware, so the software wasn't a proble
 
 This site describes some of the modifications I made on the way. Notable changes include:
 * Addition of a home limit sensor with corresponding firmware.
-* Addition of a 3D printed Arduino bumper for mounting the Arduino Uno board to the base.
+* Addition of a 3D printed Arduino bumper for mounting the Arduino UNO board to the base.
 * Addition of a top ring to hold a plexiglass window.
 * Greatly modified Arduino sketch which adds many new shapes, randomization functions, and fixes several problems that were encountered with the original sketch.
 * Addition of a power switch with associated 3D printable box.
 * Replacement of the small wooden gears with new 3D printed ones.
+* The highly modified original software version for use with the Arduino UNO - *MySandTable*.
+* A software version - *MySandTable2350* - that replaces the Arduino UNO with an Adafruit Metro RP2350 board.
+* A software version - *MySandTableFreeRTOS* - that uses the FreeRTOS real-time operating system on the Metro RP2350 board.
+* A software version - *MySandTableFreeRTOSExp* - that plans motion several moves ahead in order to help smooth out the motion.  This version was originally experimental, thus the 'Exp' suffix.  However, it is currently stable and is the preferred RP2350 version.
 ---
 # General Issues/Fixes/Useful Information
-## .PDF File Generation
+
 This was my first experience with laser cutters.  The Instructable included .DXF and .SKP files for the laser cut parts.  I couldn't make use of the .SKP file, but found that I could work with the .DXF files.  For these I used [QCAD](https://qcad.org/en/) which is a free, open source application for 2D CAD drafting.  The available laser cutter required .PDF files though.  I ended up using QCAD to edit the original .DXF file and produce a .SVG file.  Then I used [Inkskape](https://inkscape.org/?about-screen=1) to convert the .SVG file to .PDF.  The workflow was as follows:
 1. Use QCAD to edit the original .DXF file.
 2. Use QCAD to generate the .SVG file.
@@ -40,7 +44,7 @@ The Instructable used a single 15mm x 3mm magnet on the end of the linear arm.  
 ![Rings Callout](https://i.imgur.com/u8Uh9qX.jpeg)
 * After assembly, I found that the table wasn't securely attached to the base, so it was too easy to attempt to pick the unit up and have the table detach from the base.  I did not want the table to permanently connect to the base since I knew that maintenance would then be impossible.  I decided on the simple approach of drilling  1/16" holes in the table vertical rods, and insert a wire through the hole to keep the table attached to the base.  This allowed for easy  detachment of the table from the base by simply removing the wires from the rods.
 ![Retaining Wire](https://i.imgur.com/207iJ32.jpeg)
-* The original holes for the potentiometers were too close to the Arduino Uno board.  I moved them to the center of the corresponding boards.  I also added labels as shown below.  After some use, I decided that the pot labels would be better placed above the potentioneters, but left them as is.
+* The original holes for the potentiometers were too close to the Arduino UNO board.  I moved them to the center of the corresponding boards.  I also added labels as shown below.  After some use, I decided that the pot labels would be better placed above the potentioneters, but left them as is.
  ![Front Low Level View](https://i.imgur.com/gy55XrQ.jpeg)
 * I found that the potentiometer face plates were not very secure.  To fix this, I carefully drilled 5/64" holes through the faceplates and base plate and inserted small nails.
 * I originally added rubber feet to the bottom of the base.  It turned out that they prevented easy shaking of the table to clear it, which is very useful when debugging.  I replaced the rubber feet with felt pads and found that these were much better.  The feet I ended up using were [these](https://www.amazon.com/Black-Self-Adhesive-Felt-Bumpers/dp/B07DYQJRDB/ref=sr_1_1?sr=8-1).
@@ -96,7 +100,7 @@ I accidentally mounted the linear gear in the opposite direction from how the In
   		Vref = Desired Current x 0.71 x 2 
   		     = 0.99V for 700mA per phase
   		
-# Arduino Uno
+# Arduino UNO
 * I used the Arduino UNO that came with the CNC shield.
 * Found that mounting the Arduino is difficult, especially when gear assembly is already in place.  Created a 3D printed Arduino bumper with side mounting holes to help in placing the Arduino.  See the included **Arduino Bumper.stl** file.
 * Found that M3 screws fit nicely into 7/64" holes in plywood.  Used M3 screws to mount the Arduino with bumper to base plywood.
@@ -138,7 +142,7 @@ I accidentally mounted the linear gear in the opposite direction from how the In
 * I use these [LEDs](https://www.amazon.com/gp/product/B0C8HTH282)
 * Drilled a 5/32" horizontal hole into the upper ring to route LED cable into the ring vertical hole.
 * Drilled a 5/16" hole in vertical support to pass LED cable through.
-* Added a  [2 Conductor JST Connector](https://www.davesrce.com/product-page/jst-connectors?gQT=1) to attach the LEDs to the Arduino Uno so that top may easily be disconnected from base.
+* Added a  [2 Conductor JST Connector](https://www.davesrce.com/product-page/jst-connectors?gQT=1) to attach the LEDs to the Arduino UNO so that top may easily be disconnected from base.
 * Added a [Self-Adhesive Super Klip](https://www.amazon.com/Super-Glue-KW10-12-Klips-120-Pack/dp/B00FY8WHEU) as a cable organizer for the LED cable.
 ![LED Connector 1](https://i.imgur.com/DXwuwZe.jpeg)
 ![LED Connector 2](https://i.imgur.com/6Vc9H8k.jpeg)
@@ -475,7 +479,7 @@ Limited capability to control the sand table remotely via the serial port was ad
  
 # Conclusions
 This has been a great project.  I am very happy with the results.  It gave me a chance to learn more about laser cutting and some useful tools for it.  I would recommend it to anyone with moderate electronics skills.  However, there are a few things I would consider doing differently if I were to make another sand table.
-* The Arduino Uno is somewhat under powered for this project.  It is relatively slow by today's standards, and is very memory limited.  For example, MySandTable.ino uses 90% of the Arduino's memory, and runs a little choppy on some of the more complex shapes.  There are two ways to approach this problem.  First, one could offload shape generation code to another processor which could communicate with the Arduino via its USB port.  The Arduino would then only contain communication and motor driver code.  This is the path taken by [another sand table design I've seen](https://github.com/DIY-Machines/Kinetic-Sand-Art-Table).  This is not a bad approach, but it is more expensive, and requires maintaining 2 separate code bases.  I prefer a second path which would be to use a better processor.  The [Adafruit Metro 2350](https://www.adafruit.com/product/6003) is a (mostly) drop in replacement for the Arduino UNO board, but it uses the Raspberry Pi 2350 processor which is almost 10 x as fast and has many times more memory.  This is a great replacement for the UNO, but requires a few firmware changes.  I have completed this update, and will document it in a future project.
+* The Arduino UNO is somewhat under powered for this project.  It is relatively slow by today's standards, and is very memory limited.  For example, MySandTable.ino uses 90% of the Arduino's memory, and runs a little choppy on some of the more complex shapes.  There are two ways to approach this problem.  First, one could offload shape generation code to another processor which could communicate with the Arduino via its USB port.  The Arduino would then only contain communication and motor driver code.  This is the path taken by [another sand table design I've seen](https://github.com/DIY-Machines/Kinetic-Sand-Art-Table).  This is not a bad approach, but it is more expensive, and requires maintaining 2 separate code bases.  I prefer a second path which would be to use a better processor.  The [Adafruit Metro 2350](https://www.adafruit.com/product/6003) is a (mostly) drop in replacement for the Arduino UNO board, but it uses the Raspberry Pi 2350 processor which is almost 10 x as fast and has many times more memory.  This is a great replacement for the UNO, but requires a few firmware changes.  I have completed this update, and will document it in a future project.
 * I might consider making the table a bit bigger.  The size of this table is a bit small, and the motors can certainly handle larger parts.  The limit for me would be the size of work pieces that the laser cutter is capable of.
 * I would consider painting the bottom of the table black in order to make the sand shapes stand out more.  (I'm not sure if this is a good idea or not, but I'd try it anyway).
 * I would update the laser files to add holes that I manually drilled.

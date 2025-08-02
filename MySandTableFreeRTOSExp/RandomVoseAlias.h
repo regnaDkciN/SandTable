@@ -34,7 +34,7 @@ public:
      *
      * @param probabilities The list of probabilities.
      ***************************************************************************/
-    RandomVoseAlias(const std::vector<double>& probabilities) : m_InitDone(false)
+    RandomVoseAlias(const std::vector<float_t>& probabilities) : m_InitDone(false)
     {
         Init(probabilities);
     }
@@ -46,7 +46,7 @@ public:
      *
      * @param probabilities The list of probabilities.
      ***************************************************************************/
-    bool Init(const std::vector<double>& probabilities);
+    bool Init(const std::vector<float_t>& probabilities);
 
 
     /****************************************************************************
@@ -55,11 +55,11 @@ public:
      * @return A random value sampled from the underlying distribution.
      ***************************************************************************/
     int Next();
-    
-    
+
+
 private:
     /* The m_Probability and m_Alias tables. */
-    std::vector<int>    m_Alias;            // Alias vector.
-    std::vector<double> m_Probability;      // Probability vector.
-    bool                m_InitDone;         // False until initialization is complete.
+    std::vector<int>     m_Alias;            // Alias vector.
+    std::vector<float_t> m_Probability;      // Probability vector.
+    bool                 m_InitDone;         // False until initialization is complete.
 };
