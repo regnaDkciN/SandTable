@@ -1332,6 +1332,7 @@ void ServoControlTask(__unused void *param)
                 taskEXIT_CRITICAL();
 
                 // Wait until the target is reached or an abort is commanded.
+                // Periodically check for abort.
                 while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) &&
                        !AbortShape)
                 {
@@ -1506,11 +1507,12 @@ void UpdateSpeeds()
     Pausing = (SpeedDelay >= (SPEED_DELAY_MAX_VAL - 512 / MICROSTEPS)) || RemotePause;
     digitalWrite(PAUSE_LED_PIN, Pausing);
 
-    // Set the values atomically.
-    taskENTER_CRITICAL();
+    // Set the values.  It would be good to protect the following 2 lines with
+    // critical sections so that both servos would see the change at the same
+    // time, but it was decided that it really wasn't necessary, and could add
+    // to motion roughness.
     RotDelay   = SpeedDelay * RotSpeedFactor;
     InOutDelay = SpeedDelay * InOutSpeedFactor;
-    taskEXIT_CRITICAL();
 } // End UpdateSpeeds().
 
 
@@ -1570,11 +1572,12 @@ void SetSpeedFactors(float_t rotFactor, float_t inOutFactor)
     rotFactor   = constrain(rotFactor,   MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
     inOutFactor = constrain(inOutFactor, MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
 
-    // Set the values atomically so they take effect simultaneously.
-    taskENTER_CRITICAL();
+    // Set the values.  It would be good to protect the following 2 lines with
+    // critical sections so that both servos would see the change at the same
+    // time, but it was decided that it really wasn't necessary, and could add
+    // to motion roughness.
     RotSpeedFactor   = rotFactor;
     InOutSpeedFactor = inOutFactor;
-    taskEXIT_CRITICAL();
 } // End SetSpeedFactors().
 
 
@@ -2180,7 +2183,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
     taskEXIT_CRITICAL();
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
-    // MRPointCount equals 0;
+    // MRPointCount equals 0.  Periodically check for abort.
     while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(500)) != pdTRUE) && !AbortShape)
     {
         CalculateXY();       // Keep track of the location as it moves.
@@ -3110,7 +3113,7 @@ void ShapeTask(__unused void *param)
     // the start of this task which is the only task that uses random numbers.
     randomSeed(RandomSeed);
     LOG_F(LOG_ALWAYS, "Seed = %u\n", RandomSeed);
-    
+
     // On startup we wipe the board and display my initials.
     // Change this as desired.  It is the power-up greeting.
     ClearFromIn();

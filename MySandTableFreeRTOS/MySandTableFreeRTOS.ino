@@ -297,6 +297,9 @@ volatile bool LastMRPoints = false;
 // True when ShapeTask initialization is done.
 volatile bool GeneratingShapes = false;
 
+// Handle for shape task.
+TaskHandle_t      ShapeHandle        = NULL;
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // F O R W A R D   D E C L A R A T I O N S
@@ -1168,6 +1171,9 @@ void RotateToAngle(float_t angle)
     // Don't do any more if we're already at the target rotation.
     if (RotStepsTo != RotSteps)
     {
+       // Make sure we start with the servo complete flag inactive.
+        xTaskNotifyStateClear(ShapeHandle);
+
         // Set the direction and start the move.
         DirRot = (((RotStepsTo > RotSteps) &&
                    (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
@@ -1176,7 +1182,8 @@ void RotateToAngle(float_t angle)
         RotOn = true;
 
         // Wait for the move to complete.
-        while(RotOn)
+        while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(500)) != pdTRUE) &&
+               !AbortShape)
         {
             CalculateXY();
         }
@@ -1204,12 +1211,17 @@ inline bool IsRotHome()  { return !digitalRead(ROT_HOME_PIN); }
 /////////////////////////////////////////////////////////////////////////////////
 void MoveTo(float_t x, float_t y)
 {
+   // Make sure we start with the servo complete flag inactive.
+    xTaskNotifyStateClear(ShapeHandle);
+
     // Calculate the target in/out and rotary values and start moving.
     ReverseKinematics(x, y);
 
     // Wait until the target is reached.
-    while (RotOn || InOutOn)
+    while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) &&
+           !AbortShape)
     {
+        // Do nothing.
     }
 } // End MoveTo().
 
@@ -2030,6 +2042,9 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
     }
     LastInOutDir = DirInOut;
 
+    // Make sure we start with the move complete flag inactive.
+    xTaskNotifyStateClear(ShapeHandle);
+
     // Start the move by turning the motors on atomically.
     taskENTER_CRITICAL();
     RotOn   = true;
@@ -2038,7 +2053,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
     // MRPointCount equals 0;
-    while ((RotOn || InOutOn) && !AbortShape)
+    while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(500)) != pdTRUE) && !AbortShape)
     {
         CalculateXY();       // Keep track of the location as it moves.
         Display();
@@ -3082,7 +3097,6 @@ void setup()
     vTaskCoreAffinitySet(PrintHandle, 1 << 1);
 
     // Create the task to generatse motion.  It will run on core 0.
-    TaskHandle_t ShapeHandle = NULL;
     xTaskCreate(ShapeTask, "Path", 8192, NULL, 5, &ShapeHandle);
     vTaskCoreAffinitySet(ShapeHandle, 1 << 0);
 
@@ -3119,6 +3133,8 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
+    BaseType_t taskWoken = false;
+
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
     {
@@ -3181,8 +3197,14 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
             {
                 InOutOn = false;
             }
+            if (!RotOn && !InOutOn)
+            {
+                xTaskNotifyFromISR(ShapeHandle, 0, eNoAction, &taskWoken);
+            }
         }
     } // End if (RotOn && !Pausing)
+
+    portYIELD_FROM_ISR(taskWoken);
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
@@ -3200,6 +3222,8 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
+    BaseType_t taskWoken = false;
+
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
     {
@@ -3224,6 +3248,10 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             if (InOutSteps == InOutStepsTo)
             {
                 InOutOn = false;
+                if (!RotOn)
+                {
+                    xTaskNotifyFromISR(ShapeHandle, 0, eNoAction, &taskWoken);
+                }
             }
             LastMRPoints = false;
         }
@@ -3254,12 +3282,15 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 {
                     RotOn   = false;
                     InOutOn = false;
+                    xTaskNotifyFromISR(ShapeHandle, 0, eNoAction, &taskWoken);
                 }
                 // Remember the current in/out direction for next time.
                 LastInOutDir = DirInOut;
             }
         } // End else (MRPointCount)
     } // End if (InOutOn && !Pausing)
+
+    portYIELD_FROM_ISR(taskWoken);
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
