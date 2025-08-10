@@ -32,7 +32,7 @@ The diagram below attempts to show the most important parts of the old design's 
 <img src=https://i.imgur.com/18xk1SS.jpeg width=800>
 
 Execution proceeds as follows:
-1. A shape function calculates the next X,Y position of the shape and calls ```GotoXY()`` with the new position.
+1. A shape function calculates the next X,Y position of the shape and calls ```GotoXY()``` with the new position.
 2. ```GotoXY()``` loops, breaking the move into smaller segments, basically interpolating between the current position and the new segment position.  It calls ```MoveTo()``` with the new segment position.
 3. ```MoveTo()``` calls ```ReverseKinematics()``` with the new segment position, then goes to sleep waiting on the move to complete.
 4. ```ReverseKinematics()``` generates the servo positions corresponding to the new segment X,Y coordinates.  It then starts the move and returns to ```MoveTo()```.
@@ -65,7 +65,7 @@ To help further understand the new design, compare the following new design diag
 <img src=https://i.imgur.com/tJWiD7c.jpeg width=600>
 
 Execution of the new design proceeds as follows:
-1. Just as before, a shape function calculates the next X,Y position of the shape and calls ```GotoXY()`` with the new position.
+1. Just as before, a shape function calculates the next X,Y position of the shape and calls ```GotoXY()``` with the new position.
 2. Just as before, ```GotoXY()``` breaks the move into smaller segments, basically interpolating between the current position and the new segment position. However, unlike before, ```GotoXY()``` calls ```ReverseKinematics()``` with the new segment position.
 3. ```ReverseKinematics()``` generates the servo position based on the new segment X,Y position.  It then attempts to send the new servo position to the Motion Queue via a call to ```xQueueSend()```.  If the Motion Queue is already full, the task goes to sleep waiting for space to free up on the Motion Queue. 
 4. When space becomes available on the Motion Queue, ```ReverseKinematics()``` saves the new servo position on the queue and immediately returns to ```GotoXY()```.  
@@ -109,7 +109,7 @@ The commands that cause the current motion to abort ('R' and 'N') added code to 
 The ```RotateToAngle()``` function rotates the rotary axis to a specified angle from the origin leaving the in/out arm position unchanged.  Unlike ```ForceInOut()``` and ```ForceRot()```, this function generates a coordinated move.  However, it is more like ```MotorRatios()``` in that it bypasses
 
 ### WaitForMoveComplete()
-A new function - ```WaitForMoveComplete()``` was added to wait for the last move of a shape to complete before continuing on.  This was necessary due to the addition of the Motion Queue.  Shapes must fully complete execution, including finishing all queued moves, before the shape is considered to be complete.  ```WaitForMoveComplete()``` is called from a few places in the code that are not strictly considered as being the end of a shape.  These places include any place that ```GotoXY()``` is called, but not as part of a shape.  For example, the code for ```ExtendInOut()`` is now the following:
+A new function - ```WaitForMoveComplete()``` was added to wait for the last move of a shape to complete before continuing on.  This was necessary due to the addition of the Motion Queue.  Shapes must fully complete execution, including finishing all queued moves, before the shape is considered to be complete.  ```WaitForMoveComplete()``` is called from a few places in the code that are not strictly considered as being the end of a shape.  These places include any place that ```GotoXY()``` is called, but not as part of a shape.  For example, the code for ```ExtendInOut()``` is now the following:
 ```
 void ExtendInOut()
 {
