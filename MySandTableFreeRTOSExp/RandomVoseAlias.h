@@ -4,10 +4,10 @@
  *
  * An implementation of the m_Alias method implemented using Vose's algorithm.
  * The m_Alias method allows for efficient sampling of random values from a
- * discrete m_Probability distribution (i.e. rolling a loaded die) in O(1) time
+ * discrete probability distribution (i.e. rolling a loaded die) in O(1) time
  * each after O(n) preprocessing time.
  *
- * For a complete writeup on the m_Alias method, including the intuition and
+ * For a complete writeup on the alias method, including the intuition and
  * important proofs, please see the article "Darts, Dice, and Coins: Sampling
  * from a Discrete Distribution" at
  *
@@ -29,8 +29,8 @@ public:
 
 
     /****************************************************************************
-     * Constructs a new RandomVoseAlias to sample from a discrete distribution and
-     * hand back outcomes based on the m_Probability distribution.
+     * Constructs a new RandomVoseAlias to sample from a discrete distribution
+     * and hand back outcomes based on the probability distribution.
      *
      * @param probabilities The list of probabilities.
      ***************************************************************************/
@@ -42,7 +42,7 @@ public:
 
     /****************************************************************************
      * Initializes an existing RandomVoseAlias to sample from a discrete
-     * distribution and hand back outcomes based on the m_Probability distribution.
+     * distribution and hand back outcomes based on the probability distribution.
      *
      * @param probabilities The list of probabilities.
      ***************************************************************************/

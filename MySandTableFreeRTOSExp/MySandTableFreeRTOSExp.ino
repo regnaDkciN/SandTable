@@ -254,9 +254,9 @@ volatile float_t RadAngle = 0.0;      // Current angle of ball from the origin (
 
 // General runtime variables.
 volatile int_fast32_t InOutSteps   = 0;      // Current # steps in/out is away from 0.
-int_fast32_t          InOutStepsTo = 0;      // In/out target steps for move.
+volatile int_fast32_t InOutStepsTo = 0;      // In/out target steps for move.
 volatile int_fast32_t RotSteps     = 0;      // Current # steps rotary is away from 0.
-int_fast32_t          RotStepsTo   = 0;      // Rotary target steps for move.
+volatile int_fast32_t RotStepsTo   = 0;      // Rotary target steps for move.
 volatile bool         RotOn        = false;  // 'true' if rotary axis is moving.
 volatile bool         InOutOn      = false;  // 'true' if inout axis is moving.
 volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
@@ -650,10 +650,11 @@ void HandleRemoteCommandsTask(__unused void *param)
 
             // Read the command and remove any trailing junk from the input buffer.
             int_fast16_t numBytesRead = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
-            do
+            while (isspace(buf[numBytesRead - 1]) && (numBytesRead > 0))
             {
-                buf[numBytesRead--] = '\0';
-            } while (isspace(buf[numBytesRead]) && (numBytesRead >= 0));
+                buf[--numBytesRead] = '\0';
+
+            }
 
             // Handle the remote command.
             switch (toupper(buf[0]))
@@ -960,13 +961,16 @@ void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Move the in/out axis as specified.  We do this within a critical section
     // so that interrupts won't affect the microsecond timing that we use.
+    // I don't like moving the entire move into a critical section, but it seems
+    // like the only way to get the timing right.  Also, it doesn't seem to
+    // affect the rest of the system adversly.
+    taskENTER_CRITICAL();
     for (int_fast32_t x = 0; x < steps; x++)
     {
-        taskENTER_CRITICAL();
         InOutStepper.Step(DirInOut);
         delayMicroseconds(delay);
-        taskEXIT_CRITICAL();
     }
+    taskEXIT_CRITICAL();
 } // End ForceInOut().
 
 
@@ -997,13 +1001,16 @@ void ForceRot(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Move the rotation axis as specified.  We do this within a critical section
     // so that interrupts won't affect the microsecond timing that we use.
+    // I don't like moving the entire move into a critical section, but it seems
+    // like the only way to get the timing right.  Also, it doesn't seem to
+    // affect the rest of the system adversly.
+    taskENTER_CRITICAL();
     for (int_fast32_t x = 0; x < steps; x++)
     {
-        taskENTER_CRITICAL();
         RotStepper.Step(DirRot);
         delayMicroseconds(delay);
-        taskEXIT_CRITICAL();
     }
+    taskEXIT_CRITICAL();
 } // End ForceRot().
 
 
@@ -1127,33 +1134,32 @@ void ExtendInOut()
 /////////////////////////////////////////////////////////////////////////////////
 void RotateToAngle(float_t angle)
 {
+    // Temporary planner position data.
+    PlannerData newPosData;
+
     // angle is in radians in the range -pi to pi.  Convert any negative angle to
     // positive.
     angle += (angle < 0.0) ? PI_X_2 : 0.0;
 
     // Calculate the rotation steps and limit as needed.
-    RotStepsTo = (int_fast16_t)roundf(((angle * (float_t)ROT_TOTAL_STEPS) / PI_X_2));
-    if (RotStepsTo >= ROT_TOTAL_STEPS)
+    newPosData.m_RotStepsTo =
+        (int_fast16_t)roundf(((angle * (float_t)ROT_TOTAL_STEPS) / PI_X_2));
+    if (newPosData.m_RotStepsTo >= ROT_TOTAL_STEPS)
     {
-        RotStepsTo -= ROT_TOTAL_STEPS;
+        newPosData.m_RotStepsTo -= ROT_TOTAL_STEPS;
     }
 
     // Don't do any more if we're already at the target rotation.
-    if (RotStepsTo != RotSteps)
+    if (newPosData.m_RotStepsTo != RotSteps)
     {
-        // Set the direction and start the move.
-        DirRot = (((RotStepsTo > RotSteps) &&
-                   (RotStepsTo - RotSteps < ROT_TOTAL_STEPS / 2)) ||
-                  ((RotStepsTo < RotSteps) && (RotSteps - RotStepsTo > ROT_TOTAL_STEPS / 2)))
-                   ? CCW : CW;
-        RotOn = true;
+        // Set the target in/out position to its current position.
+        newPosData.m_InOutStepsTo = InOutSteps;
 
-        // Wait for the move to complete.
-        while(RotOn)
-        {
-            CalculateXY();
-        }
-        CalculateXY();
+        // Queue the new position data to the servo control task and wait for the
+        // move to complete.  Note that when an abort shape is commanded, this
+        // queue will be reset, so we can wait infinitely here.
+        xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(9999999));
+        WaitForMoveComplete();
     }
 } // End RotateToAngle().
 
@@ -1247,6 +1253,11 @@ bool WaitForMoveComplete()
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
+    // Update our planner position.
+    CalculateXY();
+    PlannerCurrentX = CurrentX;
+    PlannerCurrentY = CurrentY;
+
     // If we timed out, then something is wrong.  Reset the queue.
     if (!timeLeftMs || AbortShape)
     {
@@ -1280,7 +1291,8 @@ void ServoControlTask(__unused void *param)
     while (1)
     {
         MoveInProcess = false;
-        if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)))
+        if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)) &&
+            !AbortShape)
         {
             // We don't need to protect the following code since both interrupts
             // are currently disabled via InOutOn and RotOn both being false at
@@ -1640,7 +1652,7 @@ void EndShape(bool delay)
     // Wait for shape to complete.
     WaitForMoveComplete();
 
-    // Update our planner position.
+    // Update our planner position now that the shape has completed.
     CalculateXY();
     PlannerCurrentX = CurrentX;
     PlannerCurrentY = CurrentY;
@@ -2152,7 +2164,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
         }
         else
         {
-            cycles = min((uint_fast32_t)(40.0 / ratio), 2 * MAX_CYCLES);
+            cycles = min((uint_fast32_t)(40.0 / ratio), 6 * MAX_CYCLES);
         }
     }
 
@@ -2950,11 +2962,11 @@ void RandomSuperStar()
 // RandomShapes[]
 //
 // This is an array of ShapeInfo instances which is used to select random shapes
-// to be displayed.  The weight value of each entry is based on how frequently
+// to be displayed.  The weight value of each entry is based on how often
 // each shape should execute based on how often a random wipe is executed.
 // For example:
-//      - RandomPlot should execute 5 times as frequently as RandomWipe.
-//      - RandomSuperStar should execute 10 times as frequently as RandomWipe.
+//      - RandomPlot should execute 2 times as often as RandomWipe.
+//      - RandomSuperStar should execute 3 times as often as RandomWipe.
 //      - ...
 /////////////////////////////////////////////////////////////////////////////////
 ShapeInfo RandomShapes[] =
@@ -3235,6 +3247,7 @@ void setup()
     ShapeIteration    = 0;
     RandomSeedChanged = false;
     GeneratingShapes  = false;
+    MoveInProcess     = false;
     ResetShapes();
 
     // Initialize our weighted random object with probabilities specified in
