@@ -21,6 +21,11 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 21-AUG-2025
+//   - Added number of points argument to all spirograph shapes.
+//   - Tweaked the print queue and planner queue sizeds.
+//   - Increased the pausing limit check to account for analog noise.
+//   - Several other minor code improvements.
 // - 02-AUG-2025
 //   - Replaced use of double with float_t since the floating point issue has been
 //     fixed in version 2.2.0 of Piko SDK.  Result is roughly 4 x speed improvement
@@ -131,6 +136,7 @@ const int_fast32_t  ROT_TOTAL_STEPS   = 2000 * MICROSTEPS;
                                                 // Rotation axis total steps.
 const int_fast32_t  INOUT_TOTAL_STEPS = 537 * MICROSTEPS;
                                                 // In/Out axis total steps.
+const float_t       DFLT_STEPS_PER_UNIT = 10.0; // Default steps per unit.
 const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to inout
                                                 // (small) gear.
 const float_t       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
@@ -240,7 +246,7 @@ const uint_fast16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lin
 const uint_fast16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
 
 const size_t        MAX_LOG_STRING_SIZE = 100;   // Number of bytes in print buffer.
-const size_t        PRINT_QUEUE_SIZE    = 8;     // Size of print queue.
+const size_t        PRINT_QUEUE_SIZE    = 20;    // Size of print queue.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -318,7 +324,7 @@ volatile bool GeneratingShapes = false;
 TaskHandle_t      ServoCtrlHandle    = NULL;    // Handle for servo control task.
 TaskHandle_t      ShapeHandle        = NULL;    // Handle for shape task.
 QueueHandle_t     PlannerQueueHandle = 0;       // Handle for planner queue.
-const UBaseType_t PLANNER_Q_LENGTH   = 20;      // Num entries in planner queue.
+const UBaseType_t PLANNER_Q_LENGTH   = 50;      // Num entries in planner queue.
 volatile float_t  PlannerCurrentX    = 0.0;     // Planned location of ball (X).
 volatile float_t  PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
 volatile bool     MoveInProcess      = false;   // True if moves are in process.
@@ -327,7 +333,6 @@ volatile bool     MoveInProcess      = false;   // True if moves are in process.
 RandomVoseAlias WeightedRandom;
 // Vector of weighted probabilities used with WeightedRandom.
 std::vector<float_t> Probabilities;
-
 
 // PlannerData structure.  Used to pass data between the planner and the
 // servo controller task.
@@ -347,7 +352,7 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data);
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data);
 void    EndShape(bool delay = true);
 void    LogExecutionStats();
-
+bool    WaitForMoveComplete();
 
 /////////////////////////////////////////////////////////////////////////////////
 // S U P P O R T   S T R U C T U R E S   A N D   C L A S S E S
@@ -1158,7 +1163,7 @@ void RotateToAngle(float_t angle)
         // Queue the new position data to the servo control task and wait for the
         // move to complete.  Note that when an abort shape is commanded, this
         // queue will be reset, so we can wait infinitely here.
-        xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(9999999));
+        xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(portMAX_DELAY));
         WaitForMoveComplete();
     }
 } // End RotateToAngle().
@@ -1218,7 +1223,7 @@ void ReverseKinematics(float_t newX, float_t newY)
     // Queue the new position data to the servo control task.  Note that when an
     // abort shape is commanded, this queue will be reset, so we can wait infinitely
     // here.
-    xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(9999999));
+    xQueueSend(PlannerQueueHandle, &newPosData, pdMS_TO_TICKS(portMAX_DELAY));
 
 } // End ReverseKinematics().
 
@@ -1516,7 +1521,7 @@ void UpdateSpeeds()
 
     // Indicate if we're pausing by checking against a value slightly lower than
     // the max speed delay.  Upeate the pausing LED accordingly.
-    Pausing = (SpeedDelay >= (SPEED_DELAY_MAX_VAL - 512 / MICROSTEPS)) || RemotePause;
+    Pausing = (SpeedDelay >= (SPEED_DELAY_MAX_VAL - 2048 / MICROSTEPS)) || RemotePause;
     digitalWrite(PAUSE_LED_PIN, Pausing);
 
     // Set the values.  It would be good to protect the following 2 lines with
@@ -1628,14 +1633,27 @@ void StartShape(const char *pFmt, ...)
 /////////////////////////////////////////////////////////////////////////////////
 // EndShape()
 //
-// This function is normally called at the end of each shape execution.  It
-// normally just delays for 3 seconds then returns.  However, it may also aid
-// in debugging if PAUSE_ON_DONE is 'true'.  When enabled via the PAUSE_ON_DONE
-// macro, execution will stop at the end of every shape until the speed pot is
-// set to zero then non-zero.
+// This function is called at the end of each shape execution.  It waits for the
+// final moves to complete, then updates planner positiion and logs completion.
+// It normally just delays for 3 seconds then returns.  However, it may also aid
+// in debugging if the PAUSE_ON_DONE macro is 'true'.  When enabled via the
+// PAUSE_ON_DONE macro, execution will stop at the end of every shape until the
+// speed pot is set to zero then non-zero.
+//
+// Arguments:
+//   delay : If true, a 3 second delay occurs before return.  If false, it returns
+//           immediately.
 /////////////////////////////////////////////////////////////////////////////////
 void EndShape(bool delay)
 {
+    // Wait for shape to complete.
+    WaitForMoveComplete();
+
+    // Update our planner position now that the shape has completed.
+    CalculateXY();
+    PlannerCurrentX = CurrentX;
+    PlannerCurrentY = CurrentY;
+
     // Announce that the shape is done.
     LOG_F(LOG_INFO, "End Shape\n");
 
@@ -1648,14 +1666,6 @@ void EndShape(bool delay)
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
-
-    // Wait for shape to complete.
-    WaitForMoveComplete();
-
-    // Update our planner position now that the shape has completed.
-    CalculateXY();
-    PlannerCurrentX = CurrentX;
-    PlannerCurrentY = CurrentY;
 
     // Delay a bit if requested.
     if (delay)
@@ -2538,25 +2548,48 @@ void RandomRose()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner wheel, and
 // an offset from the rolling inner wheel.  The result is a cycloid shape that is
-// highly dependent on the 3 argument values.
+// highly dependent on the 6 argument values.  The X and Y components are scaled
+// which makes for some interesting shapes.
 //
 // Arguments:
 //    - fixedR : Radius of fixed outer circle.
 //    - r      : Radius of the rolling circle.
 //    - a      : Distance from the center of the rolling circle.
+//    - xScale : X axis scaling.  Can be negative.
+//    - yScale : Y axis scaling.  Can be negative.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
-void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
+void Spirograph (uint_fast16_t fixedR, uint_fast16_t r,
+                       uint_fast16_t a, float_t xScale = 1.0,
+                       float_t yScale = 1.0,
+                       uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, MAX_SCALE_I);
     r      = constrain(r, MIN_SPIRO_SMALLR, fixedR - 5);
     a      = constrain(a, MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    xScale = constrain(xScale, -10.0, 10.0);
+    const float_t MIN_SCALE = 0.1;
+    if (xScale > -MIN_SCALE && xScale < MIN_SCALE)
+    {
+        xScale = (xScale > 0.0 ? 1.0 : -1.0);
+    }
+    if (yScale > -MIN_SCALE && yScale < MIN_SCALE)
+    {
+        yScale = (yScale > 0.0 ? 1.0 : -1.0);
+    }
+    yScale = constrain(yScale, -10.0, 10.0);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph(%d,%d,%d)\n", fixedR, r, a);
+    StartShape("Spirograph(%d,%d,%d,%.2f,%.2f,%d)\n",
+                fixedR, r, a, xScale, yScale, points);
 
+    xScale *= a;
+    yScale *= a;
     float_t rDiff      = (float_t)(fixedR - r); // Difference between fixed radius and r.
     float_t rDiffRatio = rDiff / r;            // Ratio for later use.
+    float_t revAngle   = PI_X_2 / (float_t)points;
 
     // Calculate the number of cycles to complete the plot.
     uint_fast16_t larger = max(fixedR, r);
@@ -2569,21 +2602,21 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
     float_t offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if cycle log mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == false.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle = revAngle * (float_t)i;
 
         // Calculate the Spirograph coordinates.
-        float_t x = rDiff * cosf(angle) + a * cosf(rDiffRatio * angle);
-        float_t y = rDiff * sinf(angle) - a * sinf(rDiffRatio * angle);
+        float_t x = rDiff * cosf(angle) + xScale * cosf(rDiffRatio * angle);
+        float_t y = rDiff * sinf(angle) - yScale * sinf(rDiffRatio * angle);
 
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(x, y, offsetAngle);
@@ -2599,13 +2632,32 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
 /////////////////////////////////////////////////////////////////////////////////
 void RandomSpirograph()
 {
-    // Generate some legal arguments for the call to Spirograph().
-    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, MAX_SCALE_I + 1);
+    // Generate some random legal arguments for the call to Spirograph().
+    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, (9 * MAX_SCALE_I) / 10);
     uint_fast16_t r      = random(MIN_SPIRO_SMALLR, fixedR - 5);
     uint_fast16_t a      = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    float_t       xscale = 1.0;
+    float_t       yscale = 1.0;
+    uint_fast16_t points = SPIRO_NUM_POINTS;
 
-    // Make the call to Spirograph().
-    Spirograph(fixedR, r, a);
+    // Very rarely we want to scale the shape differently.
+    if (random(0, 100) > 95)
+    {
+        xscale = RandomFloat(-10.0, 10.0);
+    }
+    if (random(0, 100) > 95)
+    {
+        yscale = RandomFloat(-10.0, 10.0);
+    }
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
+
+    // Make the call to RandomSpirographScaled().
+    Spirograph(fixedR, r, a, xscale, yscale, points);
 } // End RandomSpirograph().
 
 
@@ -2614,7 +2666,7 @@ void RandomSpirograph()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner wheel, a
 // second inner wheel, and an offset from the second rolling inner wheel.
-// The result is a cycloid shape that is highly dependent on the 4 argument
+// The result is a cycloid shape that is highly dependent on the 5 argument
 // values.
 //
 // Arguments:
@@ -2622,19 +2674,22 @@ void RandomSpirograph()
 //    - r1     : Radius of the first rolling circle,.
 //    - r2     : Radius of the second rolling circle.
 //    - d      : Distance from the center of the second rolling circle.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
 void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
-                 uint_fast16_t d)
+                 uint_fast16_t d, uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10));
     r1     = constrain(r1, MIN_SPIRO_SMALLR, fixedR - 3);
     r2     = constrain(r2, MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 8));
     d      = constrain(d,  1, MAX_SCALE_I);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph2(%d,%d,%d,%d)\n", fixedR, r1, r2, d);
+    StartShape("Spirograph2(%d,%d,%d,%d,%d)\n", fixedR, r1, r2, d, points);
 
+    float_t revAngle = PI_X_2 / (float_t)points;
     float_t rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
     float_t r12Diff    = r1 - r2;      // Difference between 2 radii of rolling circles.
     float_t baseAngle2 = rDiff / r1;   // Pre calculate to save loop execution time.
@@ -2651,17 +2706,17 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
     float_t offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle1 = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle1 = revAngle * (float_t)i;
 
         // Calculate the position of the first rolling circle (r1) around the fixed circle.
         float_t x1 = rDiff * cosf(angle1);
@@ -2697,9 +2752,16 @@ void RandomSpirograph2()
     uint_fast16_t r1     = random(MIN_SPIRO_SMALLR, fixedR - 2);
     uint_fast16_t r2     = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
     uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t points = SPIRO_NUM_POINTS;
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
 
     // Make the call to Spirograph2().
-    Spirograph2(fixedR, r1, r2, d);
+    Spirograph2(fixedR, r1, r2, d, points);
 } // End RandomSpirograph2().
 
 
@@ -2708,22 +2770,25 @@ void RandomSpirograph2()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner square, and
 // an offset from the rolling inner square.  The result is a cycloid shape that is
-// highly dependent on the 3 argument values.
+// highly dependent on the 4 argument values.
 //
 // Arguments:
 //    - fixedR : Radius of the fixed circle.
 //    - s      : Side length of the square.
 //    - d      : Offset from the center to the drawing tip.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
-void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d)
+void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d,
+                          uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
-    fixedR = constrain(fixedR, MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10));
-    s      = constrain(s, 1, fixedR / 2);
-    d      = constrain(d, 1, MAX_SCALE_I);
+    fixedR = constrain(fixedR, MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10));
+    s      = constrain(s, 1, fixedR / 2 - 1);
+    d      = constrain(d, 1, MAX_SCALE_I - 1);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("SpirographWithSquare(%d,%d,%d)\n", fixedR, s, d);
+    StartShape("SpirographWithSquare(%d,%d,%d,%d)\n", fixedR, s, d, points);
 
     // Calculate the radius of the path traced by the center of the square.
     // Center of the square will move along a circle of radius (FIXED_R - s / 2).
@@ -2731,6 +2796,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     float_t r = ((float_t)fixedR - halfS);
     // Pre-calculate a few values to minimize loop time.
     float_t rotAngleBase = (float_t)fixedR / (float_t)s;
+    float_t revAngle = PI_X_2 / (float_t)points;
 
     // Calculate the number of cycles to complete the plot.
     uint_fast16_t larger = max(fixedR, s);
@@ -2741,17 +2807,17 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     float_t offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle = revAngle * (float_t)i;
 
         // Position of the square's center.
         float_t cx = r * cosf(angle);
@@ -2791,12 +2857,19 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
 void RandomSpirographWithSquare()
 {
     // Generate some legal arguments for the call to SpirographWithSquare().
-    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10) + 1);
-    uint_fast16_t s      = random(1, fixedR / 2 + 1);
-    uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t s      = random(1, fixedR / 2 - 1);
+    uint_fast16_t d      = random(1, MAX_SCALE_I);
+    uint_fast16_t points = SPIRO_NUM_POINTS;
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
 
     // Make the call to SpirographWithSquare().
-    SpirographWithSquare(fixedR, s, d);
+    SpirographWithSquare(fixedR, s, d, points);
 } // End RandomSpirographWithSquare().
 
 
@@ -2842,7 +2915,7 @@ void StarSeries()
     LOG_F(LOG_INFO, "StarSeries");
 
     // Generate some legal arguments for the calls to Star().
-    uint_fast16_t points = random(MIN_STAR_POINTS + 2, MAX_STAR_POINTS / 4);
+    uint_fast16_t points = random(MIN_STAR_POINTS + 1, MAX_STAR_POINTS / 3);
     float_t       ratio  = RandomFloat(MIN_STAR_RATIO, MAX_STAR_RATIO);
     uint_fast16_t size   = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
     float_t       rot    = RadAngle;
@@ -2974,9 +3047,9 @@ ShapeInfo RandomShapes[] =
     ShapeInfo("RandomWipe", RandomWipe, 1),
     ShapeInfo("RandomPlot", RandomPlot, 2),
     ShapeInfo("RandomLines", RandomLines, 3),
+    ShapeInfo("RandomCircle", RandomCircle, 4),
     ShapeInfo("RandomSuperStar", RandomSuperStar, 10),
     ShapeInfo("EllipseSeries", EllipseSeries, 10),
-    ShapeInfo("RandomCircle", RandomCircle, 12),
     ShapeInfo("HeartSeries", HeartSeries, 15),
     ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 20),
     ShapeInfo("RandomSpirograph2", RandomSpirograph2, 25),
@@ -3146,6 +3219,7 @@ void ShapeTask(__unused void *param)
         {
             xQueueReset(PlannerQueueHandle);
             AbortShape = false;
+            WaitForMoveComplete();
         }
 
         // Start over with a clean board if the random seed has changed.
@@ -3318,11 +3392,11 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    BaseType_t taskWoken = false;
-
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
     {
+        BaseType_t taskWoken = false;
+
         // Step the rotary servo in the proper direction.
         RotStepper.Step(DirRot);
 
@@ -3387,9 +3461,9 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 xTaskNotifyFromISR(ServoCtrlHandle, 0, eNoAction, &taskWoken);
             }
         }
-    } // End if (RotOn && !Pausing)
 
-    portYIELD_FROM_ISR(taskWoken);
+        portYIELD_FROM_ISR(taskWoken);
+  } // End if (RotOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
@@ -3407,11 +3481,11 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    BaseType_t taskWoken = false;
-
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
     {
+        BaseType_t taskWoken = false;
+
         // Step the in/out servo in the proper direction.
         InOutStepper.Step(DirInOut);
 
@@ -3474,9 +3548,9 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 LastInOutDir = DirInOut;
             }
         } // End else (MRPointCount)
-    } // End if (InOutOn && !Pausing)
 
-    portYIELD_FROM_ISR(taskWoken);
+        portYIELD_FROM_ISR(taskWoken);
+    } // End if (InOutOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
