@@ -12,9 +12,9 @@ This site describes some of the modifications I made on the way. Notable changes
 * Addition of a power switch with associated 3D printable box.
 * Replacement of the small wooden gears with new 3D printed ones.
 * The highly modified original software version for use with the Arduino UNO - *MySandTable*.
-* A software version - *MySandTable2350* - that replaces the Arduino UNO with an Adafruit Metro RP2350 board.
-* A software version - *MySandTableFreeRTOS* - that uses the FreeRTOS real-time operating system on the Metro RP2350 board.
-* A software version - *MySandTableFreeRTOSExp* - that plans motion several moves ahead in order to help smooth out the motion.  This version was originally experimental, thus the 'Exp' suffix.  However, it is currently stable and is the preferred RP2350 version.
+* A software version - *MySandTable2350* - that replaces the Arduino UNO with an Adafruit Metro RP2350 board.  As of 21-AUG-2025 this branch will no longer be updated.
+* A software version - *MySandTableFreeRTOS* - that uses the FreeRTOS real-time operating system on the Metro RP2350 board.  As of 21-AUG-2025 this branch will no longer be updated.
+* A software version - *MySandTableFreeRTOSExp* - that plans motion several moves ahead in order to help smooth out the motion.  This version was originally experimental, thus the 'Exp' suffix.  However, it is currently stable and is the preferred RP2350 version.  All future development and fixes will be done on this version.
 ---
 # General Issues/Fixes/Useful Information
 

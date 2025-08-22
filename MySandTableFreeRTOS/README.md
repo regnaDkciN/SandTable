@@ -2,6 +2,7 @@ Upgrading RP2350 Based Sand Table to FreeRTOS
 ===
 ![Sand Table](https://i.imgur.com/tNOBlu8.jpeg)
 
+**As of 21-AUG-2025 this branch will no longer be updated, but is kept for historical design info.**
 
 This document describes the firmware design and code changes that were made to the [RP2350 based Sand Table](https://github.com/regnaDkciN/SandTable/tree/main/MySandTable2350) to use the [FreeRTOS](https://www.freertos.org/) real time operating system (RTOS).
 

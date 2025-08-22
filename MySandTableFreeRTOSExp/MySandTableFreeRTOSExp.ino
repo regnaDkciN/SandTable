@@ -21,21 +21,21 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
-// - 21-AUG-2025
+// - 21-AUG-2025 JMC
 //   - Added number of points argument to all spirograph shapes.
-//   - Tweaked the print queue and planner queue sizeds.
+//   - Tweaked the print queue and planner queue sizes.
 //   - Increased the pausing limit check to account for analog noise.
 //   - Several other minor code improvements.
-// - 02-AUG-2025
+// - 02-AUG-2025 JMC
 //   - Replaced use of double with float_t since the floating point issue has been
 //     fixed in version 2.2.0 of Piko SDK.  Result is roughly 4 x speed improvement
 //     for floating point operations, but about 4kb larger memory size???
 //   - Minor adjustments to shape table.
 //   - Added ability to change steps per unit remotely to adjust movement smoothness.
-// - 30-JUL-2025
+// - 30-JUL-2025 JMC
 //   - Fixed some very subtle planner and ISR issues.
 //   - Increased StepsPerUnit and PLANNER_Q_LENGTH for smoother (quieter) operation.
-// - 28-JUL-2025
+// - 28-JUL-2025 JMC
 //   - Re-worked random path selection to use RandomVoseAlias class.
 //   - Fixed a couple of minor issues.
 // - 12-JUL-2025 JMC

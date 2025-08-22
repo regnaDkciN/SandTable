@@ -20,8 +20,20 @@
 //   - Updated to use FreeRTOS.
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
+// NOTE: THIS VERSION IS NOW OBSOLETE.  THE MySandTaableFreeRTOSExp BRANCH:
+//       https://github.com/regnaDkciN/SandTable/tree/main/MySandTableFreeRTOSExp
+//       WILL CONTAIN ALL FIXES AND NEW FUNCTIONALITY.
+//
 // History:
-// - 02-AUG-2025
+// - 21-AUG-2025 JMC
+//   - NOTE: THIS IS THE LAST UPDATE TO THIS VERSION OF THE SAND TABLE.  ALL
+//     FUTURE WORK WILL BE DONE ON THE MySandTaableFreeRTOSExp BRANCH:
+//     https://github.com/regnaDkciN/SandTable/tree/main/MySandTableFreeRTOSExp
+//   - Added number of points argument to all spirograph shapes.
+//   - Tweaked the print queue size.
+//   - Increased the pausing limit check to account for analog noise.
+//   - Several other minor code improvements.
+// - 02-AUG-2025 JMC
 //   - Replaced use of double with float_t since the floating point issue has been
 //     fixed in version 2.2.0 of Piko SDK.  Result is roughly 4 x speed improvement
 //     for floating point operations, but about 4kb larger memory size???
@@ -67,6 +79,7 @@
 #include <FreeRTOS.h>           // For FreeRTOS core.
 #include "SerialLogFreeRTOS.h"  // For data logging macro (LOG_F).
 #include "STStepper.pio.h"      // For STStepper class and stepper PIO state machine.
+#include "RandomVoseAlias.h"    // For RandomVoseAlias (weighted random number) class.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -115,6 +128,7 @@ const int_fast32_t  ROT_TOTAL_STEPS   = 2000 * MICROSTEPS;
                                                 // Rotation axis total steps.
 const int_fast32_t  INOUT_TOTAL_STEPS = 537 * MICROSTEPS;
                                                 // In/Out axis total steps.
+const float_t       DFLT_STEPS_PER_UNIT = 10.0; // Default steps per unit.
 const int_fast16_t  GEAR_RATIO        = 10;     // Ratio of rotary (big) gear to inout
                                                 // (small) gear.
 const float_t       MAX_SCALE_F       = 100.0;  // Maximum X or Y coordinate value.
@@ -224,7 +238,7 @@ const uint_fast16_t MIN_RANDOM_POINTS = 20;      // Minimum number of random lin
 const uint_fast16_t MAX_RANDOM_POINTS = 100;     // Maximum number of random lines.
 
 const size_t        MAX_LOG_STRING_SIZE = 100;   // Number of bytes in print buffer.
-const size_t        PRINT_QUEUE_SIZE    = 8;     // Size of print queue.
+const size_t        PRINT_QUEUE_SIZE    = 20;    // Size of print queue.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -299,6 +313,11 @@ volatile bool GeneratingShapes = false;
 
 // Handle for shape task.
 TaskHandle_t      ShapeHandle        = NULL;
+// Create a weighted random object for use in selecting the next shape to execute.
+RandomVoseAlias WeightedRandom;
+// Vector of weighted probabilities used with WeightedRandom.
+std::vector<float_t> Probabilities;
+
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -371,15 +390,17 @@ public:
     //   - pName  : This is a pointer to a string representing the name of the shape.
     //   - pShape : This is a pointer to the function that will generate a shape.
     //              The function has no arguments and returns nothing.
-    //   - delay  : The number of execution cycles that must elapse between
-    //              executions of *pShape().
+    //   - weight : The weight of this object.  Used to generate a weighted
+    //              probabilities vector which is used to randomly select shapes
+    //              for execution.  A higher value causes the shape to be
+    //              selected more frequently.
     /////////////////////////////////////////////////////////////////////////////
-    ShapeInfo(const char *pName, void (*pShape)(), uint_fast16_t delay)
+    ShapeInfo(const char *pName, void (*pShape)(), uint_fast16_t weight)
     {
         // Initialize our data based on our arguments.
         m_pName     = pName;
         m_pShape    = pShape;
-        m_Delay     = delay;
+        m_Weight    = weight;
         m_LastCycle = 0;
         m_Count     = 0;
     } // End constructor.
@@ -388,31 +409,19 @@ public:
     /////////////////////////////////////////////////////////////////////////////
     // MakeShape()
     //
-    // This method enforces the delay between consecutive executions of pShape().
+    // This method executes the shape associated with this instance.
     //
     // Arguments:
     //   - cycle : This is the current cycle (iteration) of shape generation
     //             It is incremented by the caller each time a shape is
     //             generated.
     /////////////////////////////////////////////////////////////////////////////
-    bool MakeShape(uint_fast16_t cycle)
+    void MakeShape(uint_fast16_t cycle)
     {
-        // Assume we're going to fail.
-        bool retval = false;
-
-        // Have enough iterations passed since our last execution?
-        if (cycle - m_LastCycle >= m_Delay)
-        {
-            // Yes, it's ok to make our shape.  Do it!
+        // Make our shape and bump our usage count.
             m_Count++;
+        m_LastCycle = cycle;
             (*m_pShape)();
-
-            // Remember that we just executed.
-            m_LastCycle = cycle;
-            retval = true;
-        }
-        // Let the caller know if we executed or not.
-        return retval;
     } // End MakeShape().
 
 
@@ -444,6 +453,14 @@ public:
     /////////////////////////////////////////////////////////////////////////////
     const char *GetName() { return m_pName; }
 
+    /////////////////////////////////////////////////////////////////////////////
+    // GetWeight()
+    //
+    // Returns the randomization weight.
+    /////////////////////////////////////////////////////////////////////////////
+    uint_fast16_t GetWeight() { return m_Weight; }
+
+
 private:
     // Private methods so the user can't call them.
     ShapeInfo();
@@ -451,7 +468,8 @@ private:
 
     const char   *m_pName;       // Name string.
     void         (*m_pShape)();  // Pointer to function to execute if not too soon.
-    uint_fast16_t m_Delay;       // Number of iterations between consecutive executions.
+    uint_fast16_t m_Weight;      // Randomization weigh of this instance.  Higher
+                                 // values cause more frequent execution.
     uint_fast16_t m_LastCycle;   // Iteration that we last executed.
     uint_fast32_t m_Count;       // Count of number of times we executed.
 }; // End class ShapeInfo.
@@ -612,10 +630,11 @@ void HandleRemoteCommandsTask(__unused void *param)
 
             // Read the command and remove any trailing junk from the input buffer.
             int_fast16_t numBytesRead = Serial.readBytesUntil('\n', buf, BUFLEN - 1);
-            do
+            while (isspace(buf[numBytesRead - 1]) && (numBytesRead > 0))
             {
-                buf[numBytesRead--] = '\0';
-            } while (isspace(buf[numBytesRead]) && (numBytesRead >= 0));
+                buf[--numBytesRead] = '\0';
+
+            }
 
             // Handle the remote command.
             switch (toupper(buf[0]))
@@ -916,13 +935,16 @@ void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Move the in/out axis as specified.  We do this within a critical section
     // so that interrupts won't affect the microsecond timing that we use.
+    // I don't like moving the entire move into a critical section, but it seems
+    // like the only way to get the timing right.  Also, it doesn't seem to
+    // affect the rest of the system adversly.
+    taskENTER_CRITICAL();
     for (int_fast32_t x = 0; x < steps; x++)
     {
-        taskENTER_CRITICAL();
         InOutStepper.Step(DirInOut);
         delayMicroseconds(delay);
-        taskEXIT_CRITICAL();
     }
+        taskEXIT_CRITICAL();
 } // End ForceInOut().
 
 
@@ -953,13 +975,16 @@ void ForceRot(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
 
     // Move the rotation axis as specified.  We do this within a critical section
     // so that interrupts won't affect the microsecond timing that we use.
+    // I don't like moving the entire move into a critical section, but it seems
+    // like the only way to get the timing right.  Also, it doesn't seem to
+    // affect the rest of the system adversly.
+    taskENTER_CRITICAL();
     for (int_fast32_t x = 0; x < steps; x++)
     {
-        taskENTER_CRITICAL();
         RotStepper.Step(DirRot);
         delayMicroseconds(delay);
-        taskEXIT_CRITICAL();
     }
+        taskEXIT_CRITICAL();
 } // End ForceRot().
 
 
@@ -1386,14 +1411,15 @@ void UpdateSpeeds()
 
     // Indicate if we're pausing by checking against a value slightly lower than
     // the max speed delay.  Upeate the pausing LED accordingly.
-    Pausing = (SpeedDelay >= (SPEED_DELAY_MAX_VAL - 512 / MICROSTEPS)) || RemotePause;
+    Pausing = (SpeedDelay >= (SPEED_DELAY_MAX_VAL - 2048 / MICROSTEPS)) || RemotePause;
     digitalWrite(PAUSE_LED_PIN, Pausing);
 
-    // Set the values atomically.
-    taskENTER_CRITICAL();
+    // Set the values.  It would be good to protect the following 2 lines with
+    // critical sections so that both servos would see the change at the same
+    // time, but it was decided that it really wasn't necessary, and could add
+    // to motion roughness.
     RotDelay   = SpeedDelay * RotSpeedFactor;
     InOutDelay = SpeedDelay * InOutSpeedFactor;
-    taskEXIT_CRITICAL();
 } // End UpdateSpeeds().
 
 
@@ -1453,11 +1479,12 @@ void SetSpeedFactors(float_t rotFactor, float_t inOutFactor)
     rotFactor   = constrain(rotFactor,   MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
     inOutFactor = constrain(inOutFactor, MIN_MOTOR_RATIO, MAX_MOTOR_RATIO);
 
-    // Set the values atomically so they take effect simultaneously.
-    taskENTER_CRITICAL();
+    // Set the values.  It would be good to protect the following 2 lines with
+    // critical sections so that both servos would see the change at the same
+    // time, but it was decided that it really wasn't necessary, and could add
+    // to motion roughness.
     RotSpeedFactor   = rotFactor;
     InOutSpeedFactor = inOutFactor;
-    taskEXIT_CRITICAL();
 } // End SetSpeedFactors().
 
 
@@ -1491,11 +1518,16 @@ void StartShape(const char *pFmt, ...)
 /////////////////////////////////////////////////////////////////////////////////
 // EndShape()
 //
-// This function is normally called at the end of each shape execution.  It
-// normally just delays for 3 seconds then returns.  However, it may also aid
-// in debugging if PAUSE_ON_DONE is 'true'.  When enabled via the PAUSE_ON_DONE
-// macro, execution will stop at the end of every shape until the speed pot is
-// set to zero then non-zero.
+// This function is called at the end of each shape execution.  It waits for the
+// final moves to complete, then updates planner positiion and logs completion.
+// It normally just delays for 3 seconds then returns.  However, it may also aid
+// in debugging if the PAUSE_ON_DONE macro is 'true'.  When enabled via the
+// PAUSE_ON_DONE macro, execution will stop at the end of every shape until the
+// speed pot is set to zero then non-zero.
+//
+// Arguments:
+//   delay : If true, a 3 second delay occurs before return.  If false, it returns
+//           immediately.
 /////////////////////////////////////////////////////////////////////////////////
 void EndShape(bool delay)
 {
@@ -1510,16 +1542,13 @@ void EndShape(bool delay)
         {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
-
-        // Now wait for speed pot pause to be cleared.
-        while (Pausing)
-        {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
     }
 
-    // Delay a bit to allow time to set speed pot back to desired value.
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Delay a bit if requested.
+    if (delay)
+    {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
 } // End EndShape().
 
 
@@ -2021,7 +2050,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
         }
         else
         {
-            cycles = min((uint_fast32_t)(40.0 / ratio), 2 * MAX_CYCLES);
+            cycles = min((uint_fast32_t)(40.0 / ratio), 6 * MAX_CYCLES);
         }
     }
 
@@ -2052,7 +2081,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
     taskEXIT_CRITICAL();
 
     // Wait for the move to complete.  ISR will turn off RotOn and InOutOn when
-    // MRPointCount equals 0;
+    // MRPointCount equals 0.  Periodically check for abort.
     while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(500)) != pdTRUE) && !AbortShape)
     {
         CalculateXY();       // Keep track of the location as it moves.
@@ -2395,25 +2424,48 @@ void RandomRose()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner wheel, and
 // an offset from the rolling inner wheel.  The result is a cycloid shape that is
-// highly dependent on the 3 argument values.
+// highly dependent on the 6 argument values.  The X and Y components are scaled
+// which makes for some interesting shapes.
 //
 // Arguments:
 //    - fixedR : Radius of fixed outer circle.
 //    - r      : Radius of the rolling circle.
 //    - a      : Distance from the center of the rolling circle.
+//    - xScale : X axis scaling.  Can be negative.
+//    - yScale : Y axis scaling.  Can be negative.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
-void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
+void Spirograph (uint_fast16_t fixedR, uint_fast16_t r,
+                       uint_fast16_t a, float_t xScale = 1.0,
+                       float_t yScale = 1.0,
+                       uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, MAX_SCALE_I);
     r      = constrain(r, MIN_SPIRO_SMALLR, fixedR - 5);
     a      = constrain(a, MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    xScale = constrain(xScale, -10.0, 10.0);
+    const float_t MIN_SCALE = 0.1;
+    if (xScale > -MIN_SCALE && xScale < MIN_SCALE)
+    {
+        xScale = (xScale > 0.0 ? 1.0 : -1.0);
+    }
+    if (yScale > -MIN_SCALE && yScale < MIN_SCALE)
+    {
+        yScale = (yScale > 0.0 ? 1.0 : -1.0);
+    }
+    yScale = constrain(yScale, -10.0, 10.0);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph(%d,%d,%d)\n", fixedR, r, a);
+    StartShape("Spirograph(%d,%d,%d,%.2f,%.2f,%d)\n",
+                fixedR, r, a, xScale, yScale, points);
 
+    xScale *= a;
+    yScale *= a;
     float_t rDiff      = (float_t)(fixedR - r); // Difference between fixed radius and r.
     float_t rDiffRatio = rDiff / r;            // Ratio for later use.
+    float_t revAngle   = PI_X_2 / (float_t)points;
 
     // Calculate the number of cycles to complete the plot.
     uint_fast16_t larger = max(fixedR, r);
@@ -2426,21 +2478,21 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
     float_t offsetAngle = RadAngle;
 
     // Loop to generate the plot.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if cycle log mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == false.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle = revAngle * (float_t)i;
 
         // Calculate the Spirograph coordinates.
-        float_t x = rDiff * cosf(angle) + a * cosf(rDiffRatio * angle);
-        float_t y = rDiff * sinf(angle) - a * sinf(rDiffRatio * angle);
+        float_t x = rDiff * cosf(angle) + xScale * cosf(rDiffRatio * angle);
+        float_t y = rDiff * sinf(angle) - yScale * sinf(rDiffRatio * angle);
 
         // Move the drawing arm to the calculated coordinates.
         RotateGotoXY(x, y, offsetAngle);
@@ -2456,13 +2508,32 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r, uint_fast16_t a)
 /////////////////////////////////////////////////////////////////////////////////
 void RandomSpirograph()
 {
-    // Generate some legal arguments for the call to Spirograph().
-    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, MAX_SCALE_I + 1);
+    // Generate some random legal arguments for the call to Spirograph().
+    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, (9 * MAX_SCALE_I) / 10);
     uint_fast16_t r      = random(MIN_SPIRO_SMALLR, fixedR - 5);
     uint_fast16_t a      = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    float_t       xscale = 1.0;
+    float_t       yscale = 1.0;
+    uint_fast16_t points = SPIRO_NUM_POINTS;
 
-    // Make the call to Spirograph().
-    Spirograph(fixedR, r, a);
+    // Very rarely we want to scale the shape differently.
+    if (random(0, 100) > 95)
+    {
+        xscale = RandomFloat(-10.0, 10.0);
+    }
+    if (random(0, 100) > 95)
+    {
+        yscale = RandomFloat(-10.0, 10.0);
+    }
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
+
+    // Make the call to RandomSpirographScaled().
+    Spirograph(fixedR, r, a, xscale, yscale, points);
 } // End RandomSpirograph().
 
 
@@ -2471,7 +2542,7 @@ void RandomSpirograph()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner wheel, a
 // second inner wheel, and an offset from the second rolling inner wheel.
-// The result is a cycloid shape that is highly dependent on the 4 argument
+// The result is a cycloid shape that is highly dependent on the 5 argument
 // values.
 //
 // Arguments:
@@ -2479,19 +2550,22 @@ void RandomSpirograph()
 //    - r1     : Radius of the first rolling circle,.
 //    - r2     : Radius of the second rolling circle.
 //    - d      : Distance from the center of the second rolling circle.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
 void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
-                 uint_fast16_t d)
+                 uint_fast16_t d, uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
     fixedR = constrain(fixedR, MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10));
     r1     = constrain(r1, MIN_SPIRO_SMALLR, fixedR - 3);
     r2     = constrain(r2, MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 8));
     d      = constrain(d,  1, MAX_SCALE_I);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph2(%d,%d,%d,%d)\n", fixedR, r1, r2, d);
+    StartShape("Spirograph2(%d,%d,%d,%d,%d)\n", fixedR, r1, r2, d, points);
 
+    float_t revAngle = PI_X_2 / (float_t)points;
     float_t rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
     float_t r12Diff    = r1 - r2;      // Difference between 2 radii of rolling circles.
     float_t baseAngle2 = rDiff / r1;   // Pre calculate to save loop execution time.
@@ -2508,17 +2582,17 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
     float_t offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle1 = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle1 = revAngle * (float_t)i;
 
         // Calculate the position of the first rolling circle (r1) around the fixed circle.
         float_t x1 = rDiff * cosf(angle1);
@@ -2554,9 +2628,16 @@ void RandomSpirograph2()
     uint_fast16_t r1     = random(MIN_SPIRO_SMALLR, fixedR - 2);
     uint_fast16_t r2     = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
     uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t points = SPIRO_NUM_POINTS;
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
 
     // Make the call to Spirograph2().
-    Spirograph2(fixedR, r1, r2, d);
+    Spirograph2(fixedR, r1, r2, d, points);
 } // End RandomSpirograph2().
 
 
@@ -2565,22 +2646,25 @@ void RandomSpirograph2()
 //
 // Simulate a spirograph with a fixed outer wheel, a rolling inner square, and
 // an offset from the rolling inner square.  The result is a cycloid shape that is
-// highly dependent on the 3 argument values.
+// highly dependent on the 4 argument values.
 //
 // Arguments:
 //    - fixedR : Radius of the fixed circle.
 //    - s      : Side length of the square.
 //    - d      : Offset from the center to the drawing tip.
+//    - points : Number of points per revolution.
 /////////////////////////////////////////////////////////////////////////////////
-void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d)
+void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d,
+                          uint_fast16_t points = SPIRO_NUM_POINTS)
 {
     // Limit arguments to usable values.
-    fixedR = constrain(fixedR, MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10));
-    s      = constrain(s, 1, fixedR / 2);
-    d      = constrain(d, 1, MAX_SCALE_I);
+    fixedR = constrain(fixedR, MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10));
+    s      = constrain(s, 1, fixedR / 2 - 1);
+    d      = constrain(d, 1, MAX_SCALE_I - 1);
+    points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("SpirographWithSquare(%d,%d,%d)\n", fixedR, s, d);
+    StartShape("SpirographWithSquare(%d,%d,%d,%d)\n", fixedR, s, d, points);
 
     // Calculate the radius of the path traced by the center of the square.
     // Center of the square will move along a circle of radius (FIXED_R - s / 2).
@@ -2588,6 +2672,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     float_t r = ((float_t)fixedR - halfS);
     // Pre-calculate a few values to minimize loop time.
     float_t rotAngleBase = (float_t)fixedR / (float_t)s;
+    float_t revAngle = PI_X_2 / (float_t)points;
 
     // Calculate the number of cycles to complete the plot.
     uint_fast16_t larger = max(fixedR, s);
@@ -2598,17 +2683,17 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     float_t offsetAngle = RadAngle;
 
     // Loop to create the points of the cycloid.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS * cycles) && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= points * cycles) && !AbortShape; i++)
     {
         // Print the cycle countdown if verbose mode.  Note that this statement
         // will be completely optimized out if LOG_CYCLES == 0.
-        if (LOG_CYCLES && (i / SPIRO_NUM_POINTS < cycles) && (i % SPIRO_NUM_POINTS == 0))
+        if (LOG_CYCLES && (i / points < cycles) && (i % points == 0))
         {
-            LOG_F(LOG_CYCLES, "%d\n", cycles - i / SPIRO_NUM_POINTS);
+            LOG_F(LOG_CYCLES, "%d\n", cycles - i / points);
         }
 
         // Calculate the angle for this point.
-        float_t angle = SPIRO_ANGLE_BASE * (float_t)i;
+        float_t angle = revAngle * (float_t)i;
 
         // Position of the square's center.
         float_t cx = r * cosf(angle);
@@ -2648,12 +2733,19 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
 void RandomSpirographWithSquare()
 {
     // Generate some legal arguments for the call to SpirographWithSquare().
-    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (8 * MAX_SCALE_I / 10) + 1);
-    uint_fast16_t s      = random(1, fixedR / 2 + 1);
-    uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t s      = random(1, fixedR / 2 - 1);
+    uint_fast16_t d      = random(1, MAX_SCALE_I);
+    uint_fast16_t points = SPIRO_NUM_POINTS;
+
+    // Very infrequently we want to reduce the points just for a change.
+    if (random(0, 100) > 95)
+    {
+        points = random(3, SPIRO_NUM_POINTS / 10);
+    }
 
     // Make the call to SpirographWithSquare().
-    SpirographWithSquare(fixedR, s, d);
+    SpirographWithSquare(fixedR, s, d, points);
 } // End RandomSpirographWithSquare().
 
 
@@ -2699,7 +2791,7 @@ void StarSeries()
     LOG_F(LOG_INFO, "StarSeries");
 
     // Generate some legal arguments for the calls to Star().
-    uint_fast16_t points = random(MIN_STAR_POINTS + 2, MAX_STAR_POINTS / 4);
+    uint_fast16_t points = random(MIN_STAR_POINTS + 1, MAX_STAR_POINTS / 3);
     float_t       ratio  = RandomFloat(MIN_STAR_RATIO, MAX_STAR_RATIO);
     uint_fast16_t size   = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
     float_t       rot    = RadAngle;
@@ -2819,27 +2911,62 @@ void RandomSuperStar()
 // RandomShapes[]
 //
 // This is an array of ShapeInfo instances which is used to select random shapes
-// to be displayed.
+// to be displayed.  The weight value of each entry is based on how often
+// each shape should execute based on how often a random wipe is executed.
+// For example:
+//      - RandomPlot should execute 2 times as often as RandomWipe.
+//      - RandomSuperStar should execute 3 times as often as RandomWipe.
+//      - ...
 /////////////////////////////////////////////////////////////////////////////////
 ShapeInfo RandomShapes[] =
 {
-    ShapeInfo("RandomRatios", RandomRatios, 10),
-    ShapeInfo("RandomSpirograph", RandomSpirograph, 0),
-    ShapeInfo("RandomSpirograph2", RandomSpirograph2, 0),
-    ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 10),
-    ShapeInfo("RandomRose", RandomRose, 11),
-    ShapeInfo("RandomClover", RandomClover, 11),
-    ShapeInfo("RandomSuperStar", RandomSuperStar, 25),
-    ShapeInfo("RandomCircle", RandomCircle, 15),
-    ShapeInfo("RandomPlot", RandomPlot, 20),
-    ShapeInfo("PolygonSeries", PolygonSeries, 10),
-    ShapeInfo("StarSeries", StarSeries, 10),
-    ShapeInfo("HeartSeries", HeartSeries, 15),
+    ShapeInfo("RandomWipe", RandomWipe, 1),
+    ShapeInfo("RandomPlot", RandomPlot, 2),
+    ShapeInfo("RandomLines", RandomLines, 3),
+    ShapeInfo("RandomCircle", RandomCircle, 4),
+    ShapeInfo("RandomSuperStar", RandomSuperStar, 10),
     ShapeInfo("EllipseSeries", EllipseSeries, 10),
-    ShapeInfo("RandomRatiosRing", RandomRatiosRing, 10),
-    ShapeInfo("RandomWipe", RandomWipe, 30),
-    ShapeInfo("RandomLines", RandomLines, 50)
+    ShapeInfo("HeartSeries", HeartSeries, 15),
+    ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 20),
+    ShapeInfo("RandomSpirograph2", RandomSpirograph2, 25),
+    ShapeInfo("RandomRose", RandomRose, 25),
+    ShapeInfo("RandomClover", RandomClover, 25),
+    ShapeInfo("RandomRatios", RandomRatios, 30),
+    ShapeInfo("RandomSpirograph", RandomSpirograph, 30),
+    ShapeInfo("PolygonSeries", PolygonSeries, 30),
+    ShapeInfo("StarSeries", StarSeries, 30),
+    ShapeInfo("RandomRatiosRing", RandomRatiosRing, 30)
 }; // End RandomShapes[].
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// InitProbabilities()
+//
+// Steps through the RandomShapes weights and creates a vector with corresponding
+// probabilities.
+/////////////////////////////////////////////////////////////////////////////////
+void InitProbabilities()
+{
+    // Resize our probabilities vector to match the RandomShapes size.
+    Probabilities.resize(sizeof(RandomShapes) / sizeof(RandomShapes[0]));
+    float_t total = 0.0;
+
+    // Total the weights of each shape in RandomShapes.
+    for (size_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]);  i++)
+    {
+        total += (float_t)RandomShapes[i].GetWeight();
+    }
+
+    // Convert the weight of each shape to a corresponding probability value.
+    for (size_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]);  i++)
+    {
+        Probabilities[i] = (float_t)RandomShapes[i].GetWeight() / total;
+    }
+
+    // Now that the probability vector has been filled in, initialize the
+    // weighted random number generator.
+    WeightedRandom.Init(Probabilities);
+} // End InitProbabilities().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2847,28 +2974,13 @@ ShapeInfo RandomShapes[] =
 //
 // Randomly selects a randomization function to execute.  The RandomShapes array
 // contains a list of ShapeInfo instances that contain a pointer to a randomization
-// function and its corresponding skip value.  It calls the corresponding
-// ShapeInfo.MakeShape() method which determines whether or not it is ok to
-// execute the corresponding randomization function based on the current iteration
-// value.  If the shape function executes then MakeShape() returns a value
-// of 'true'.  In this case, GenerateRandomShape() increments the iteration count.
-// If the shape function does not execute, and returns 'false', the iteration
-// count is not incremented, and another random shape is considered.
+// function and its corresponding weight value.  It calls the corresponding
+// ShapeInfo.MakeShape() method to generate the shape.
 /////////////////////////////////////////////////////////////////////////////////
 void GenerateRandomShape()
 {
-    // Keep track of our iteration.
-    size_t index = 0;
-
-    // Select functions to execute at random till we find one that will actually
-    // execute.
-    do
-    {
-        // Select a random function to execute.
-        index = random(0, sizeof(RandomShapes) / sizeof(RandomShapes[0]));
-
-    // Call the random function, and try another function if it was too soon.
-    } while (!RandomShapes[index].MakeShape(ShapeIteration));
+    // Execute a random shape.
+    RandomShapes[WeightedRandom.Next()].MakeShape(ShapeIteration);
 
     // Increment the iteration count since we just executed something.
     ShapeIteration++;
@@ -2906,7 +3018,8 @@ void LogExecutionStats()
     {
         count = RandomShapes[i].GetCount();
         total += count;
-        LOG_F(LOG_ALWAYS, "%5d   %s\n", count, RandomShapes[i].GetName());
+        LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n",
+              count, Probabilities[i], RandomShapes[i].GetName());
     }
     // Display the total number of shapes that have been produced.
     LOG_F(LOG_ALWAYS, "%5d   TOTAL\n", total);
@@ -3081,6 +3194,10 @@ void setup()
     GeneratingShapes  = false;
     ResetShapes();
 
+    // Initialize our weighted random object with probabilities specified in
+    // the RandomShapes[] array.
+    InitProbabilities();
+
     // Create the task that handles pot updates.  It will run on core 1.
     TaskHandle_t ReadPotsHandle = NULL;
     xTaskCreate(ReadPotsTask, "ReadPots", 1024, NULL, 0, &ReadPotsHandle);
@@ -3133,11 +3250,11 @@ void loop()
 /////////////////////////////////////////////////////////////////////////////////
 int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    BaseType_t taskWoken = false;
-
     // Only do something if rotation movement is enabled.
     if (RotOn && !Pausing)
     {
+        BaseType_t taskWoken = false;
+
         // Step the rotary servo in the proper direction.
         RotStepper.Step(DirRot);
 
@@ -3202,9 +3319,9 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 xTaskNotifyFromISR(ShapeHandle, 0, eNoAction, &taskWoken);
             }
         }
-    } // End if (RotOn && !Pausing)
 
     portYIELD_FROM_ISR(taskWoken);
+  } // End if (RotOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
@@ -3222,11 +3339,11 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
 /////////////////////////////////////////////////////////////////////////////////
 int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 {
-    BaseType_t taskWoken = false;
-
     // Only do something if in/out movement is enabled.
     if (InOutOn && !Pausing)
     {
+        BaseType_t taskWoken = false;
+
         // Step the in/out servo in the proper direction.
         InOutStepper.Step(DirInOut);
 
@@ -3275,7 +3392,8 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             }
 
             // If we're creating multiple points and the direction has changed,
-            // deccrement the points count.
+            // deccrement the points count and notify the shape task that we're
+            //done.
             if (LastInOutDir != DirInOut)
             {
                 if (--MRPointCount == 0)
@@ -3288,9 +3406,9 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
                 LastInOutDir = DirInOut;
             }
         } // End else (MRPointCount)
-    } // End if (InOutOn && !Pausing)
 
     portYIELD_FROM_ISR(taskWoken);
+    } // End if (InOutOn && !Pausing)
 
     // In order to restart the alarm, we return a negative delay time.  This
     // causes the timer subsystem to reschedule the alarm this many microseconds
