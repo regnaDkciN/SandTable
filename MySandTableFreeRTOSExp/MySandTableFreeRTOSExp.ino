@@ -21,6 +21,25 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 13-JUL-2026 JMC
+//   - Added brightness check at power-up.  If very low brightness, then perform
+//     a random wipe.  Otherwise don't bother to wipe.  This solves the problem
+//     of having to wait for a lengthy wipe after every power-up, when it is
+//     normally not necessary.
+//   - Added FloatCoordinate structure for use with new shapes.
+//   - Added Help information to HandleRemoteCommands().
+//   - Added 2 new shirl shapes and supporting functions.  The whirl shape is an
+//     extension of the classic "Four Mice Problem" in which four mice are
+//     initially sitting at the corners of a square.  At the same time, each of
+//     the mice begin running with equal speed directly toward the mouse on their
+//     right.  This version extends that by starting with any number of mice at
+//     any initial positions.  See:
+//     https://thecalculusofexplanations.com/2022/10/09/the-four-mice-problem-2/
+//     New shapes are:
+//       * WhirlFlower which creates a multi sided flower composed of triangle
+//         shaped whirl patterns.
+//       * WhirlPoly which creates a whirl pattern based on a polygon centered
+//         at the origin.
 // - 21-AUG-2025 JMC
 //   - Added number of points argument to all spirograph shapes.
 //   - Tweaked the print queue and planner queue sizes.
@@ -373,6 +392,23 @@ struct Coordinate
     int_least8_t x;   // X coordinate.
     int_least8_t y;   // Y coordinate.
 }; // End Coordinate.
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// struct FloatCoordinate
+//
+// Structure defining one cartesian (x, y) point.  Used with PlotShapeArray().
+/////////////////////////////////////////////////////////////////////////////////
+struct FloatCoordinate
+{
+    FloatCoordinate(float_t px, float_t py)
+    {
+        x = px;
+        y = py;
+    }
+    float_t x;   // X coordinate.
+    float_t y;   // Y coordinate.
+}; // End FloatCoordinate.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -777,6 +813,28 @@ void HandleRemoteCommandsTask(__unused void *param)
                         StepsPerUnit = constrain(StepsPerUnit, 1.0, 10.0);
                     }
                     LOG_F(LOG_ALWAYS, "%f\n", StepsPerUnit);
+                break;
+                // Display help information.
+                case '?':
+                    LOG_F(LOG_ALWAYS, "\nF - Increase speed.\n");
+                    LOG_F(LOG_ALWAYS, "D - Decrease speed.\n");
+                    LOG_F(LOG_ALWAYS, "Q - Remove speed override.\n");
+                    LOG_F(LOG_ALWAYS, "B - Increase brightness.\n");
+                    LOG_F(LOG_ALWAYS, "D - Decrease brightness.\n");
+                    LOG_F(LOG_ALWAYS, "L - Remove brightness override.\n");
+                    LOG_F(LOG_ALWAYS, "P - Pause motion.\n");
+                    LOG_F(LOG_ALWAYS, "U - Unpause motion.\n");
+                    LOG_F(LOG_ALWAYS, "R <seed> - Restart with new random seed.\n");
+                    LOG_F(LOG_ALWAYS, "G - Display the current random seed.\n");
+                    LOG_F(LOG_ALWAYS, "N - Abort current shape and start next shape.\n");
+                    LOG_F(LOG_ALWAYS, "K - Keep alive (does nothing).\n");
+                    LOG_F(LOG_ALWAYS, "H - Reply with a hello string to test comms.\n");
+                    LOG_F(LOG_ALWAYS, "C - Display current shape invocation.\n");
+                    LOG_F(LOG_ALWAYS, "E - Display execution statistics.\n");
+                    LOG_F(LOG_ALWAYS, "+ - Step to next segment (debug only).\n");
+                    LOG_F(LOG_ALWAYS, "- - Step to previous segment (debug only).\n");
+                    LOG_F(LOG_ALWAYS, "%% <val> - Display or change steps per unit.\n");
+                    LOG_F(LOG_ALWAYS, "? - Display this help info.\n\n");
                 break;
                 // Default - Not anything we know about.  Just ignore it.
                 default:
@@ -1752,7 +1810,7 @@ void Circle(uint_fast16_t numLobes, uint_fast16_t xSize,
     // Show our call.
     StartShape("Circle(%d,%d,%d,%.1f)\n", numLobes, xSize, ySize, RtoD(rotation));
     // Loop to create the curve.
-    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS)  && !AbortShape; i++)
+    for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS) && !AbortShape; i++)
     {
         float_t angle = SPIRO_ANGLE_BASE * (float_t)i;
         float_t x = (float_t)xSize * cosf(angle);
@@ -2422,9 +2480,9 @@ void PolygonSeries()
     float_t       rot   = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and angle.
-    uint_fast16_t steps = 0;
+    uint_fast16_t steps   = 0;
     uint_fast16_t sizeInc = 0;
-    float_t       rotInc = 0.0;
+    float_t       rotInc  = 0.0;
     GenerateSeriesSteps(size, steps, sizeInc, rotInc);
 
     // Loop to create the polygon series.
@@ -2433,10 +2491,240 @@ void PolygonSeries()
         // Make the call to Polygon() and increment our size and rotation.
         Polygon(sides, size, rot);
         size += sizeInc;
-        rot += rotInc;
+        rot  += rotInc;
     }
     EndSeries();
 } // End PolygonSeries().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// PolyVector()
+//
+// Fill in a vector of coordinates corresponding to the points of a polygon
+// with specified number of sides, size, and rotation.
+//
+// Arguments:
+//   - numSides : Number of sides the polygon will have.
+//   - size     : Size of the polygon.
+//   - rotation : How much to rotate the polygon, in radians.
+//   - v        : Vector into which the polygon points will be saved.
+/////////////////////////////////////////////////////////////////////////////////
+void PolyVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
+                std::vector<FloatCoordinate> &v)
+{
+    LOG_F(LOG_INFO, "PolyVector(%d,%f,%f,0x%x)\n", numSides, size, rotation, v);
+
+    // Make sure we start with an empty vector.
+    v.clear();
+
+    // Make sure all arguments are within valid limits.
+    numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
+    float_t scale = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+
+    FloatCoordinate p(0.0, 0.0);
+
+    // Loop to create each pointr of the (possibly rotated) polygon.
+    for (uint_fast16_t i = 0; i < numSides; i++)
+    {
+        float_t angle = rotation + (PI_X_2 * (float_t)i) / (float_t)numSides;
+        p.x = scale * cosf(angle);
+        p.y = scale * sinf(angle);
+        v.push_back(p);
+    }
+} // End PolyVector().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// WhirlLeafVector()
+//
+// Fill in a vector of coordinates corresponding to the points of a triangle
+// with the starting point at the origin, and the other 2 points on a circle
+// of radius 'size'.  The points on the circle are (360/numSides) degrees apart.
+//
+// Arguments:
+//   - numSides : Number of sides to determine how far apart the non-origin
+//                points will be..
+//   - size     : Size (radius) of the circle.
+//   - rotation : How much to rotate the leaf, in radians.
+//   - v        : Vector into which the triangle points will be saved.
+/////////////////////////////////////////////////////////////////////////////////
+void WhirlLeafVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
+                     std::vector<FloatCoordinate> &v)
+{
+    // Start with a clean vector.
+    v.clear();
+
+    // Make sure all arguments are within valid limits.
+    numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES + 2);
+    float_t scale = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+
+    // Create our initial point.  Always (0,0).
+    FloatCoordinate p(0.0, 00.0);
+    v.push_back(p);
+
+    // Next point.
+    float_t angle = rotation;
+    p.x = scale * cosf(angle);
+    p.y = scale * sinf(angle);
+    v.push_back(p);
+
+    // Last point.
+    angle = rotation + PI_X_2 / (float_t)numSides;
+    p.x = scale * cosf(angle);
+    p.y = scale * sinf(angle);
+    v.push_back(p);
+} // End WhirlLeafVector().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// Whirl()
+//
+// Given a vector of starting points and a speed, this function draws a whirl
+// pattern.  This is an extension of the classic "Four Mice Problem" in which
+// four mice are initially sitting at the corners of a square.  At the same
+// time, each of the mice begin running with equal speed directly toward the
+// mouse on their right.  This version extends that by starting with any number
+// of mice at any initial positions.  See:
+// https://thecalculusofexplanations.com/2022/10/09/the-four-mice-problem-2/
+//
+// Arguments:
+//   - speed    : How far each whirl mouse moves per iteration.
+//   - v        : Vector containing the initial positions of all mice..
+/////////////////////////////////////////////////////////////////////////////////
+void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
+{
+    // Show our call.
+    StartShape("Whirl(%f,0x%x)\n", speed, startVector);
+
+    // Copy our starting vector and start at the origin.
+    uint_fast16_t n = startVector.size();
+    std::vector<FloatCoordinate> mice = startVector;
+    GotoXY(mice[0].x, mice[0].y);
+    uint_fast16_t iteration = 0;
+
+    // Create the next position vector, and set it equal to the starting vector.
+    std::vector<FloatCoordinate> next_positions = mice;
+
+    // Main loop.
+    bool running = true;
+    while(running && !AbortShape)
+    {
+        // Draw each line segment.
+        for (uint_fast16_t i = 0; (i < n) && !AbortShape; ++i)
+        {
+            // Target is the next mouse in order (with wrap-around).
+            uint_fast16_t target = (i + 1) % n;
+            GotoXY(mice[target].x, mice[target].y);
+
+            // Calculate direction vector for the next move.
+            float_t dx = mice[target].x - mice[i].x;
+            float_t dy = mice[target].y - mice[i].y;
+            float_t distance = sqrtf(dx * dx + dy * dy);
+
+            // Termination condition: reached the center.
+            if (distance < speed + 1.0)
+            {
+                running = false;
+                break;
+            }
+
+            // Normalize and multiply by speed.
+            float_t vx = (dx / distance) * speed;
+            float_t vy = (dy / distance) * speed;
+
+            // Apply movement.
+            next_positions[i].x = mice[i].x + vx;
+            next_positions[i].y = mice[i].y + vy;
+        }
+
+        LOG_F(LOG_INFO, "Iteration %d\n", ++iteration);
+
+        // Update current positions
+        mice = next_positions;
+    }
+    EndShape(false);
+} // End Whirl().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// WhirlFlower()
+//
+// Create a flower consisting of a specified number of petals.  Each petal is
+// a triangular whirl.
+//
+// Arguments:
+//   - numSides : Number of sides the flower will have.
+//   - size     : Size of the flower.
+//   - rotation : How much to rotate the flower, in radians.
+//   - speed    : How far each whirl trace moves per iteration.
+/////////////////////////////////////////////////////////////////////////////////
+void WhirlFlower(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
+                 float_t speed)
+{
+    StartShape("WhirlFlower(%d,%f,%f)\n", numSides, size, rotation);
+
+    // Make sure all arguments are within valid limits.
+    numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
+    float_t scale = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+
+    std::vector<FloatCoordinate> v;
+    for (uint_fast16_t i = 0; (i < numSides) && !AbortShape; i++)
+    {
+      WhirlLeafVector(numSides, scale, rotation + i * PI_X_2 / numSides, v);
+      Whirl(speed, v);
+    }
+    // Make the last petal look the same as the other ones by returning to
+    // the origin.
+    if (!AbortShape)
+    {
+        GotoXY(0.0, 0.0);
+    }
+
+    EndSeries();
+} // End WhirlFlower().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// RandomWhirlFlower()
+//
+// Create a random whirl flower.
+/////////////////////////////////////////////////////////////////////////////////
+void RandomWhirlFlower()
+{
+    // Generate some random parameters.
+    uint_fast16_t numSides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size     = random(MIN_POLY_SIZE, MAX_SCALE_I + 1);
+    float_t rotation       = RadAngle;
+    float_t speed          = random(4.0, size / 4);
+
+    WhirlFlower(numSides, size, rotation, speed);
+} // End RandomWhirlFlower().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// RandomWhirlPoly()
+//
+// Create a random whirl polygon.
+/////////////////////////////////////////////////////////////////////////////////
+void RandomWhirlPoly()
+{
+    // Generate some random parameters.
+    uint_fast16_t numSides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size     = random(MIN_POLY_SIZE, MAX_SCALE_I + 1);
+    float_t rotation       = RadAngle;
+    float_t speed          = random(4.0, size / 4);
+
+    // Generate the path, then display the whirl.
+    std::vector<FloatCoordinate> v;
+    LOG_F(LOG_INFO, "WhirlPoly(%d,%d,%f,%f\n",numSides, size, rotation, speed);
+    PolyVector(numSides, size, rotation, v);
+    Whirl(speed, v);
+
+    // This is a special case.  Whirl() ends its shape with no delay since it
+    // is called many times via WhirlFlower().  Here we end the shape so that
+    // the end of shape delay will occur.
+    EndShape();
+} // End RandomWhirlPoly().
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -3051,10 +3339,12 @@ ShapeInfo RandomShapes[] =
     ShapeInfo("RandomSuperStar", RandomSuperStar, 10),
     ShapeInfo("EllipseSeries", EllipseSeries, 10),
     ShapeInfo("HeartSeries", HeartSeries, 15),
+    ShapeInfo("RandomWhirlFlower", RandomWhirlFlower, 15),
     ShapeInfo("RandomSpirographWithSquare", RandomSpirographWithSquare, 20),
     ShapeInfo("RandomSpirograph2", RandomSpirograph2, 25),
     ShapeInfo("RandomRose", RandomRose, 25),
     ShapeInfo("RandomClover", RandomClover, 25),
+    ShapeInfo("RandomWhirlPoly", RandomWhirlPoly, 25),
     ShapeInfo("RandomRatios", RandomRatios, 30),
     ShapeInfo("RandomSpirograph", RandomSpirograph, 30),
     ShapeInfo("PolygonSeries", PolygonSeries, 30),
@@ -3199,13 +3489,20 @@ void ShapeTask(__unused void *param)
     randomSeed(RandomSeed);
     LOG_F(LOG_ALWAYS, "Seed = %u\n", RandomSeed);
 
-    // On startup we wipe the board and display my initials.
-    // Change this as desired.  It is the power-up greeting.
-    ClearFromIn();
+    // On startup we wipe the board only if the brightness is not currently
+    // set extremely low.  This allows us to skip the lengthy wiping process if
+    // we have already shaken the table, or cleared it via some other means.
+    if (Brightness < 10)
+    {
+        ClearFromIn();
+    }
+
+    // Display my initials.
+    // *** Change this as desired.  It is the power-up greeting. ***
     RotateToAngle(atan2f((float_t)JMCPlot[0].y, (float_t)JMCPlot[0].x));
     PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false, "JMCPlot");
 
-    // Inform the rest that we're uup and running.
+    // Inform the rest that we're up and running.
     GeneratingShapes = true;
 
     // Loop forever since tasks must never return.

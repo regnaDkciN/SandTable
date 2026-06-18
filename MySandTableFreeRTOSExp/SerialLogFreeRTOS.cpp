@@ -10,6 +10,8 @@
 // log data to the print task via a specified queue.
 //
 // History:
+// - 18-JUN-2026 JMC
+//   - Removed unused #include and extern.
 // - 28-JUN-2025 JMC
 //   - Original creation from SerialLog2350.h.  Updated for use with FreeRTOS.
 // - 21-APR-2025 JMC Original creation from SerialLog.h
@@ -17,8 +19,6 @@
 // Copyright (c) 2025, Joseph M. Corbett
 /////////////////////////////////////////////////////////////////////////////////
 #include "SerialLogFreeRTOS.h"
-#include <HardwareSerial.h>         //%%%jmc only used while debugging.  Remove later.
-extern HardwareSerial Serial;       //%%%jmc only used while debugging.  Remove later.
 
 // Initialize our class (SerialLogFreeRTOS) static members.
 SemaphoreHandle_t SerialLogFreeRTOS::m_Mutex = NULL;
