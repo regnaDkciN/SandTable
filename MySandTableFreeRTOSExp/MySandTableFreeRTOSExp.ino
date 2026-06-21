@@ -21,6 +21,10 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 21-JUN-2026 JMC
+//   - Fixed a very subtle bug in WaitForMoveComplete() which caused motion to
+//     hang when a move timed out.
+//   - Added some debug logging.to Whirl().
 // - 13-JUL-2026 JMC
 //   - Added brightness check at power-up.  If very low brightness, then perform
 //     a random wipe.  Otherwise don't bother to wipe.  This solves the problem
@@ -1300,20 +1304,25 @@ void ReverseKinematics(float_t newX, float_t newY)
 /////////////////////////////////////////////////////////////////////////////////
 bool WaitForMoveComplete()
 {
+    // Since all moves are broken up into small segments, no move should take
+    // very long.  If a move takes longer than 1 second, even at the lowest
+    // speed, then there is a problem.
+    const uint32_t TIMEOUT_MS = 1000;
+    const uint32_t TICK_MS = 5;
+    const uint_fast32_t MOVE_TIMEOUT_TICKS = TIMEOUT_MS / TICK_MS;
+    uint_fast32_t ticksLeft = MOVE_TIMEOUT_TICKS;
     bool moveComplete = true;
-    uint_fast32_t MOVE_TIMEOUT_MS = 1000;
-    uint_fast32_t timeLeftMs = MOVE_TIMEOUT_MS;
 
-    // Wait for shape to complete.
+    // Wait for move to complete.
     while ((MoveInProcess || uxQueueMessagesWaiting(PlannerQueueHandle)) &&
-           !AbortShape && timeLeftMs--)
+           !AbortShape && --ticksLeft)
     {
         // Don't time out if we're pausing.
         if (Pausing)
         {
-            timeLeftMs = MOVE_TIMEOUT_MS;
+            ticksLeft = MOVE_TIMEOUT_TICKS;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(TICK_MS));
     }
 
     // Update our planner position.
@@ -1322,12 +1331,12 @@ bool WaitForMoveComplete()
     PlannerCurrentY = CurrentY;
 
     // If we timed out, then something is wrong.  Reset the queue.
-    if (!timeLeftMs || AbortShape)
+    if (!ticksLeft || AbortShape)
     {
         xQueueReset(PlannerQueueHandle);
         xTaskNotify(ServoCtrlHandle, 0, eNoAction);
         moveComplete = false;
-        if (!timeLeftMs)
+        if (!ticksLeft)
         {
             LOG_F(LOG_INFO, "WaitForMoveComplete() timed out.\n");
         }
@@ -2512,7 +2521,7 @@ void PolygonSeries()
 void PolyVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
                 std::vector<FloatCoordinate> &v)
 {
-    LOG_F(LOG_INFO, "PolyVector(%d,%f,%f,0x%x)\n", numSides, size, rotation, v);
+    LOG_F(LOG_INFO, "PolyVector(%d,%f.1,%f.1,0x%x)\n", numSides, size, rotation, v);
 
     // Make sure we start with an empty vector.
     v.clear();
@@ -2594,14 +2603,15 @@ void WhirlLeafVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotatio
 void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
 {
     // Show our call.
-    StartShape("Whirl(%f,0x%x)\n", speed, startVector);
+    StartShape("Whirl(%f.1,0x%x)\n", speed, startVector);
 
     // Copy our starting vector and start at the origin.
     uint_fast16_t n = startVector.size();
     std::vector<FloatCoordinate> mice = startVector;
     GotoXY(mice[0].x, mice[0].y);
     uint_fast16_t iteration = 0;
-
+    LOG_F(LOG_DEBUG, "Vector Size: %d\n", n);
+    
     // Create the next position vector, and set it equal to the starting vector.
     std::vector<FloatCoordinate> next_positions = mice;
 
@@ -2615,12 +2625,14 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
             // Target is the next mouse in order (with wrap-around).
             uint_fast16_t target = (i + 1) % n;
             GotoXY(mice[target].x, mice[target].y);
-
+            LOG_F(LOG_DEBUG, "GotoXY: %f.1   %f.1\n", mice[target].x, mice[target].y);
+            
             // Calculate direction vector for the next move.
             float_t dx = mice[target].x - mice[i].x;
             float_t dy = mice[target].y - mice[i].y;
             float_t distance = sqrtf(dx * dx + dy * dy);
-
+            LOG_F(LOG_DEBUG, "dx: %f.2   dy: %f.2   delta: %f.2\n", dx, dy, distance);
+            
             // Termination condition: reached the center.
             if (distance < speed + 1.0)
             {
@@ -2661,7 +2673,7 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
 void WhirlFlower(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
                  float_t speed)
 {
-    StartShape("WhirlFlower(%d,%f,%f)\n", numSides, size, rotation);
+    StartShape("WhirlFlower(%d,%f.1,%f.1)\n", numSides, size, rotation);
 
     // Make sure all arguments are within valid limits.
     numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
@@ -2716,7 +2728,7 @@ void RandomWhirlPoly()
 
     // Generate the path, then display the whirl.
     std::vector<FloatCoordinate> v;
-    LOG_F(LOG_INFO, "WhirlPoly(%d,%d,%f,%f\n",numSides, size, rotation, speed);
+    LOG_F(LOG_INFO, "WhirlPoly(%d,%d,%f.1,%f.1\n",numSides, size, rotation, speed);
     PolyVector(numSides, size, rotation, v);
     Whirl(speed, v);
 
