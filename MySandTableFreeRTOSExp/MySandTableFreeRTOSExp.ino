@@ -21,6 +21,15 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 25-JUN-2026 JMC
+//   - Fixed WaitForMoveComplete() so that it waits, without timeout, for all
+//     moves to be finished.
+//   - After changing the random seed, check brightness to determine whether or
+//     not to wipe the board.
+//   - Added re-use of current random seed if none is entered when restarting.
+//   - Added system up time as part of the statistics display.
+//   - Minor Start/Stop Shape changes to Whirl shapes.
+//   - Fixed some comments.
 // - 21-JUN-2026 JMC
 //   - Fixed a very subtle bug in WaitForMoveComplete() which caused motion to
 //     hang when a move timed out.
@@ -350,7 +359,7 @@ QueueHandle_t     PlannerQueueHandle = 0;       // Handle for planner queue.
 const UBaseType_t PLANNER_Q_LENGTH   = 50;      // Num entries in planner queue.
 volatile float_t  PlannerCurrentX    = 0.0;     // Planned location of ball (X).
 volatile float_t  PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
-volatile bool     MoveInProcess      = false;   // True if moves are in process.
+TickType_t        StartupTicks       = 0;       // System ticks at startup.
 
 // Create a weighted random object for use in selecting the next shape to execute.
 RandomVoseAlias WeightedRandom;
@@ -644,6 +653,7 @@ const Coordinate JMCPlot[] =
 //  'K' (KEEP ALIVE)  Kicks the watchdog.  If no messages are received from the
 //                    serial port after REMOTE_TIMEOUT_MS milliseconds, then all
 //                    remote settings get cleared and local control is restored.
+//  'H' (HELLO)       Reply with a hello string to test comms.
 //  'C' (CUR SHAPE)   Gets the invocation string of the current shape.
 //  'E' (EXEC COUNT)  Displays count of each shape's executions.
 //  '+' (NEXT SEGMNT) Used for single stepping plot array shapes.  When detected,
@@ -653,6 +663,7 @@ const Coordinate JMCPlot[] =
 //  '%' [newVal]
 //      (GRANULARITY) Display/change steps per unit (granularity or smoothness).
 //                    newVal is limited to the range of 1.0 - 10.0
+//  '?' (HELP)        Display help information.
 /////////////////////////////////////////////////////////////////////////////////
 void HandleRemoteCommandsTask(__unused void *param)
 {
@@ -749,8 +760,13 @@ void HandleRemoteCommandsTask(__unused void *param)
                     // We don't want to re-start during initialization.
                     if (GeneratingShapes)
                     {
-                        // Read the new seed value.
-                        RandomSeed = strtoul(buf + 1, &endptr, 10);
+                        // If a new seed has been entered, then use it.
+                        // Else, use the current one.
+                        if (buf[1])
+                        {
+                            // Read the new seed value.
+                            RandomSeed = strtoul(buf + 1, &endptr, 10);
+                        }
                         taskENTER_CRITICAL();
                         // Reset the random  number generator with the new seed value.
                         randomSeed(RandomSeed);
@@ -1313,12 +1329,13 @@ bool WaitForMoveComplete()
     uint_fast32_t ticksLeft = MOVE_TIMEOUT_TICKS;
     bool moveComplete = true;
 
-    // Wait for move to complete.
-    while ((MoveInProcess || uxQueueMessagesWaiting(PlannerQueueHandle)) &&
+    // Wait for all queued moves to complete.
+    // Time out if moves are queued and no motion for too long.
+    while ((RotOn || InOutOn || uxQueueMessagesWaiting(PlannerQueueHandle)) &&
            !AbortShape && --ticksLeft)
     {
-        // Don't time out if we're pausing.
-        if (Pausing)
+        // Don't time out if we're pausing or still completing a move.
+        if (Pausing || RotOn || InOutOn)
         {
             ticksLeft = MOVE_TIMEOUT_TICKS;
         }
@@ -1362,14 +1379,12 @@ void ServoControlTask(__unused void *param)
 
     while (1)
     {
-        MoveInProcess = false;
         if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)) &&
             !AbortShape)
         {
             // We don't need to protect the following code since both interrupts
             // are currently disabled via InOutOn and RotOn both being false at
             // this point.
-            MoveInProcess = true;
             InOutStepsTo = data.m_InOutStepsTo;
             RotStepsTo   = data.m_RotStepsTo;
 
@@ -1406,7 +1421,7 @@ void ServoControlTask(__unused void *param)
             // Now start the move if either axis needs to move.
             if (bRotON || bInOutON)
             {
-               // Make sure we start with the servo complete flag inactive.
+                // Make sure we start with the servo complete flag inactive.
                 xTaskNotifyStateClear(ServoCtrlHandle);
 
                 // Start the move atomically.
@@ -2602,16 +2617,13 @@ void WhirlLeafVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotatio
 /////////////////////////////////////////////////////////////////////////////////
 void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
 {
-    // Show our call.
-    StartShape("Whirl(%f.1,0x%x)\n", speed, startVector);
-
     // Copy our starting vector and start at the origin.
     uint_fast16_t n = startVector.size();
     std::vector<FloatCoordinate> mice = startVector;
     GotoXY(mice[0].x, mice[0].y);
     uint_fast16_t iteration = 0;
     LOG_F(LOG_DEBUG, "Vector Size: %d\n", n);
-    
+
     // Create the next position vector, and set it equal to the starting vector.
     std::vector<FloatCoordinate> next_positions = mice;
 
@@ -2626,13 +2638,13 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
             uint_fast16_t target = (i + 1) % n;
             GotoXY(mice[target].x, mice[target].y);
             LOG_F(LOG_DEBUG, "GotoXY: %f.1   %f.1\n", mice[target].x, mice[target].y);
-            
+
             // Calculate direction vector for the next move.
             float_t dx = mice[target].x - mice[i].x;
             float_t dy = mice[target].y - mice[i].y;
             float_t distance = sqrtf(dx * dx + dy * dy);
             LOG_F(LOG_DEBUG, "dx: %f.2   dy: %f.2   delta: %f.2\n", dx, dy, distance);
-            
+
             // Termination condition: reached the center.
             if (distance < speed + 1.0)
             {
@@ -2649,12 +2661,11 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
             next_positions[i].y = mice[i].y + vy;
         }
 
-        LOG_F(LOG_INFO, "Iteration %d\n", ++iteration);
+        LOG_F(LOG_INFO, "%d\n", ++iteration);
 
         // Update current positions
         mice = next_positions;
     }
-    EndShape(false);
 } // End Whirl().
 
 
@@ -2728,7 +2739,7 @@ void RandomWhirlPoly()
 
     // Generate the path, then display the whirl.
     std::vector<FloatCoordinate> v;
-    LOG_F(LOG_INFO, "WhirlPoly(%d,%d,%f.1,%f.1\n",numSides, size, rotation, speed);
+    StartShape("WhirlPoly(%d,%d,%f.1,%f.1\n",numSides, size, rotation, speed);
     PolyVector(numSides, size, rotation, v);
     Whirl(speed, v);
 
@@ -3436,13 +3447,18 @@ void ResetShapes()
 /////////////////////////////////////////////////////////////////////////////////
 void LogExecutionStats()
 {
-    uint_fast32_t total = 0;
-    uint_fast32_t count = 0;
+    // Calculate the amount of time we've been up and running, and log it.
+    uint32_t seconds = (uint32_t)((xTaskGetTickCount() - StartupTicks) / configTICK_RATE_HZ);
+    uint32_t hours = seconds / 3600;
+    uint32_t minutes = (seconds / 60) % 60;
+    seconds  %= 60;
+    LOG_F(LOG_ALWAYS, "Up Time: %2d:%02d:%02d\n", hours, minutes, seconds);
 
     // Loop through each shape and display its execution count.
+    uint_fast32_t total = 0;
     for (uint_fast16_t i = 0; i < sizeof(RandomShapes) / sizeof(RandomShapes[0]); i++)
     {
-        count = RandomShapes[i].GetCount();
+        uint_fast32_t count = RandomShapes[i].GetCount();
         total += count;
         LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n",
               count, Probabilities[i], RandomShapes[i].GetName());
@@ -3538,7 +3554,13 @@ void ShapeTask(__unused void *param)
             randomSeed(RandomSeed);
             ResetShapes();
             Home();
-            ClearFromIn();
+
+            // Only wipe the board if the user wants it as indicated by a low
+            // brightness setting.
+            if (Brightness < 10)
+            {
+                ClearFromIn();
+            }
             RandomSeedChanged = false;
         }
     }
@@ -3630,7 +3652,6 @@ void setup()
     ShapeIteration    = 0;
     RandomSeedChanged = false;
     GeneratingShapes  = false;
-    MoveInProcess     = false;
     ResetShapes();
 
     // Initialize our weighted random object with probabilities specified in
@@ -3667,6 +3688,10 @@ void setup()
     // It will run on core 0 at a high priority.
     xTaskCreate(ServoControlTask, "Servo", 8192, NULL, 6, &ServoCtrlHandle);
     vTaskCoreAffinitySet(ServoCtrlHandle, 1 << 0);
+
+    // Save initial ticks.  This should normally be near zero, but we don't want
+    // to rely on that, just in case it is different for some reason.
+    StartupTicks = xTaskGetTickCount();
 
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // !!!NOTE:  MUST NOT CALL vTaskStartScheduler() OR SYSTEM WILL CRASH!!!
