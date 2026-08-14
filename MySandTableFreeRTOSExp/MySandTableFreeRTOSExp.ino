@@ -21,6 +21,23 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 14-AUG-2026 JMC
+//   - Replaced use of delayMicroseconds() with UsDelay().  The latest version
+//     of the compiler doesn't allow delayMicroseconds() to be called within
+//     critical sections.  Per earlephilhower, the SDK once did busy waits
+//     (ie no IRQ needed) but it's using alarms now and doing a wfi or
+//     equivalent. With interrupts disabled, that instruction will never complete.
+//   - Replaced use of built-in random number generator with a library found
+//     online - https://www.pcg-random.org/.  This was necessary due to the
+//     built-in RNG was not thread safe, and had problems with generating
+//     repeatable random sequences.
+//   - Fixed incorrect display of floats due to incorrect format specifier.
+//   - Reworked ShapeTask() to do all startup code within the loop.
+//   - Made RandomSeed volatile since it is modified by both the shape task
+//     and the remote command handling task..
+//   - Fixed a few rotation display values to be degrees in place of radians.
+//   - Fixed abort handling which mainly impacted ShapeTask(), ServoTask(),
+//     and MotorRatios().
 // - 25-JUN-2026 JMC
 //   - Fixed WaitForMoveComplete() so that it waits, without timeout, for all
 //     moves to be finished.
@@ -113,13 +130,14 @@
 //         code will restore operation with floats, as double precision is not
 //         needed.
 //
-// Copyright (c) 2025, Joseph M. Corbett
+// Copyright (c) 2026, Joseph M. Corbett
 /////////////////////////////////////////////////////////////////////////////////
 #include <limits.h>             // For UINT_MAX.
 #include <FreeRTOS.h>           // For FreeRTOS core.
 #include "SerialLogFreeRTOS.h"  // For data logging macro (LOG_F).
 #include "STStepper.pio.h"      // For STStepper class and stepper PIO state machine.
 #include "RandomVoseAlias.h"    // For RandomVoseAlias (weighted random number) class.
+#include "pcg_basic.h"          // For random number generator.
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -196,6 +214,7 @@ const uint_fast16_t WIPE_RASTER_INC   = 4;      // This constant should be chang
                                                 // ball size.  4 is a good value for use
                                                 // with 3mm cylindrical magnet.
 const uint_fast32_t REMOTE_TIMEOUT_MS = 10000;  // Remote command timeout (milliseconds).
+const uint_fast32_t SERVO_TIMEOUT_MS  = 60000;  // Servo completion timeout (milliseconds).
 
 // Useful constants.
 const uint_fast8_t IN              = 1;          // In/Out axis IN direction.
@@ -204,6 +223,7 @@ const uint_fast8_t CW              = 0;          // Rotation axis CLOCKWISE dire
 const uint_fast8_t CCW             = 1;          // Rotation axis COUNTERCLOCKWISE direction.
 const float_t      PI_X_2          = PI * 2.0;   // Useful in many trig calculations.
 const float_t      FLOAT_PRECISION = 1000.0;     // Use 3 significant digits for random floats.
+const float_t      FLOAT_PRECISION_INV = 1.0/FLOAT_PRECISION;
 
 // Potentiometer related constants.
 const int_fast32_t  PWM_FREQ            = 100000; // LED PWM frequency.
@@ -301,8 +321,9 @@ volatile uint_fast8_t DirInOut     = OUT;    // Current In/Out direction.
 volatile uint_fast8_t DirRot       = CW;     // Current Rotary direction.
 int64_t               InOutDelay   = 400;    // ISR delay for In/Out motor (uSec).
 int64_t               RotDelay     = 400;    // ISR delay for Rotary motor (uSec).
-uint_fast32_t         RandomSeed   = 0;      // RNG seed used at startup.
-volatile uint_fast16_t MRPointCount = 0;     // Count of the number of points displayed.
+volatile uint_fast32_t RandomSeed  = 1;      // RNG seed used at startup.
+volatile uint_fast16_t MRPointCount= 0;      // Count of the number of points displayed.
+volatile bool         MRInProcess  = false;  // 'true' if motor ratio is in process.
 float_t               RotSpeedFactor= 1.0;   // Multiplicative factor for rotational speed.
 float_t               InOutSpeedFactor= 1.0; // Multiplicative factor for in/out speed.
 volatile bool         Pausing      = false;  // 'true' when pausing.
@@ -316,9 +337,10 @@ bool                  RemoteSpeedDelay = false; // 'true' if remotely setting sp
 int_fast16_t          Brightness   = 0;      // Active LED brightness value (0 - 255).
 bool                  RemoteBrightness = false;   // 'true' if remotely setting brightness.
 bool                  RemotePause  = false;  // 'true' if pausing motion remotely.
-volatile bool         AbortShape   = false;  // 'true' if aborting ghe current shape.
+volatile bool         AbortShape   = true;   // 'true' if aborting the current shape.
+volatile bool         AbortServo   = false;  // 'true' if aborting the current move.
 uint_fast16_t         ShapeIteration = 0;    // Iteration counter for random shape generation.
-volatile bool         RandomSeedChanged = false;  // 'true' when random seed has been changed.
+volatile bool         RandomSeedChanged = true; // 'true' when random seed has been changed.
 float_t               StepsPerUnit   = 10.0; // Higher values produce smoother moves
                                              // Good values range from 1.0 to 10.0.
 
@@ -362,7 +384,11 @@ volatile float_t  PlannerCurrentY    = 0.0;     // Planned location of ball (Y).
 TickType_t        StartupTicks       = 0;       // System ticks at startup.
 
 // Create a weighted random object for use in selecting the next shape to execute.
-RandomVoseAlias WeightedRandom;
+// The RandomVoseAlias class needs a pointer to the function that returns the
+// next random number.  Here we use a forward delcaration for the function.
+int32_t NextRandom(int32_t lo, int32_t hi);
+RandomVoseAlias WeightedRandom(NextRandom);
+
 // Vector of weighted probabilities used with WeightedRandom.
 std::vector<float_t> Probabilities;
 
@@ -632,6 +658,67 @@ const Coordinate JMCPlot[] =
 
 
 /////////////////////////////////////////////////////////////////////////////////
+// UsDelay()
+//
+// Delays execution for the specified number of microseconds.
+//
+// Note:
+//   Replaced use of delayMicroseconds() with this function.  The latest version
+//   of the compiler doesn't allow delayMicroseconds() to be called within
+//   critical sections.  Per earlephilhower, the SDK once did busy waits
+//   (ie no IRQ needed) but it's using alarms now and doing a wfi or
+//   equivalent. With interrupts disabled, that instruction will never complete.
+//
+// Arguments:
+//   - delayUs : Number of microseconds to delay.
+/////////////////////////////////////////////////////////////////////////////////
+void UsDelay(uint32_t delayUs)
+{
+    uint32_t startMicros = micros();
+    while (micros() - startMicros < delayUs)
+    { /* do nothing */}
+} // End UsDelay().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// SetRandomSeed()
+//
+// Sets the random number generator's seed value.
+//
+// Note:
+//   The built-in RNG couldn't be used since it is not thread-safe.  This
+//   caused problems with not being able to repeat random sequences properly.
+//
+// Arguments:
+//   - s : The new random number generator seed value.
+/////////////////////////////////////////////////////////////////////////////////
+void SetRandomSeed(uint32_t s)
+{
+    pcg32_srandom(0xdeadbeef, s);
+} // End SetRandomSeed().
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// NextRandom()
+//
+// Fetches the next random uint32_t number value from the RNG.
+//
+// Note:
+//   The built-in RNG couldn't be used since it is not thread-safe.  This
+//   caused problems with not being able to repeat random sequences properly.
+//
+// Arguments:
+//   - lo : The lowest random value for the returned random value.
+//   - hi : One beyond the highest random value to be returned.
+/////////////////////////////////////////////////////////////////////////////////
+int32_t NextRandom(int32_t lo, int32_t hi)
+{
+    uint32_t diff = hi - lo;
+    return pcg32_boundedrand(diff) + lo;
+} // End NextRandom().
+
+
+/////////////////////////////////////////////////////////////////////////////////
 // HandleRemoteCommandsTask()
 //
 // Checks for and handles remote commands from the serial port.
@@ -691,11 +778,9 @@ void HandleRemoteCommandsTask(__unused void *param)
         // If so, then undo any remote controls that may be in effect.
         if (millis() - lastMessageMs > REMOTE_TIMEOUT_MS)
         {
-            RemoteSpeedDelay  = false;
-            RemoteBrightness  = false;
-            RemotePause       = false;
-            RandomSeedChanged = false;
-            AbortShape        = false;
+            RemoteSpeedDelay = false;
+            RemoteBrightness = false;
+            RemotePause      = false;
         }
 
         // See if we got any messages.
@@ -709,7 +794,6 @@ void HandleRemoteCommandsTask(__unused void *param)
             while (isspace(buf[numBytesRead - 1]) && (numBytesRead > 0))
             {
                 buf[--numBytesRead] = '\0';
-
             }
 
             // Handle the remote command.
@@ -768,15 +852,12 @@ void HandleRemoteCommandsTask(__unused void *param)
                             RandomSeed = strtoul(buf + 1, &endptr, 10);
                         }
                         taskENTER_CRITICAL();
-                        // Reset the random  number generator with the new seed value.
-                        randomSeed(RandomSeed);
                         // Let everyone know we changed the random seed.
                         RandomSeedChanged = true;
                         // Abort the current shape since we want the new random value to
                         // take effect at the beginning of a shape.
+                        AbortServo = false;
                         AbortShape = true;
-                        // Make sure to empty our planner queue.
-                        xQueueReset(PlannerQueueHandle);
                         taskEXIT_CRITICAL();
                     }
                     else
@@ -793,9 +874,8 @@ void HandleRemoteCommandsTask(__unused void *param)
                 // Next shape - Abort the current shape and start the next.
                 case 'N':
                     taskENTER_CRITICAL();
+                    AbortServo = false;
                     AbortShape = true;
-                    // Make sure to empty our planner queue.
-                    xQueueReset(PlannerQueueHandle);
                     taskEXIT_CRITICAL();
                 break;
                 // Keep alive - do nothing.
@@ -832,7 +912,7 @@ void HandleRemoteCommandsTask(__unused void *param)
                         StepsPerUnit = strtod(buf + 1, &endptr);
                         StepsPerUnit = constrain(StepsPerUnit, 1.0, 10.0);
                     }
-                    LOG_F(LOG_ALWAYS, "%f\n", StepsPerUnit);
+                    LOG_F(LOG_ALWAYS, "%.3f\n", StepsPerUnit);
                 break;
                 // Display help information.
                 case '?':
@@ -872,7 +952,7 @@ void HandleRemoteCommandsTask(__unused void *param)
 //
 // Returns a random boolean value ('true' or 'false').
 /////////////////////////////////////////////////////////////////////////////////
-bool RandomBool() { return (bool)random(0, 2); }
+bool RandomBool() { return (bool)NextRandom(0, 2); }
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -887,11 +967,18 @@ bool RandomBool() { return (bool)random(0, 2); }
 //
 // Returns:
 //   Returns a random float_t between the specified limits.
+//
+// Note:
+//   Whereas NextRandom() requires the maximum random value to be specified
+//   as 1 greater than the desired limit, this function requires the
+//   maximum random float to be specified as the actual desired upper limit.
 /////////////////////////////////////////////////////////////////////////////////
 float_t RandomFloat(float_t minVal, float_t maxVal)
 {
-    return (float_t)random((long)(minVal * FLOAT_PRECISION),
-                           (long)(maxVal * FLOAT_PRECISION) + 1) / FLOAT_PRECISION;
+    // Note that we add FLOAT_PRECISION_INV here to the delta.  This essentially
+    // adds 1 to the NextRandom() call.
+    uint32_t delta = roundf((maxVal - minVal + FLOAT_PRECISION_INV) * FLOAT_PRECISION);
+    return ((float_t)NextRandom(0, delta) + minVal * FLOAT_PRECISION) / FLOAT_PRECISION;
 } // End RandomFloat().
 
 
@@ -1015,6 +1102,18 @@ void CalculateXY()
 
 
 /////////////////////////////////////////////////////////////////////////////////
+// EnableInOut(), DisableInOut(), EnableRot(), DisableRot()
+//
+// These inline functions are used to enable and disable the individual axes.
+// They take no arguments and return nothing.
+/////////////////////////////////////////////////////////////////////////////////
+inline void EnableInOut()  { digitalWrite(EN_INOUT_PIN, LOW);  }
+inline void DisableInOut() { digitalWrite(EN_INOUT_PIN, HIGH); }
+inline void EnableRot()    { digitalWrite(EN_ROT_PIN,   LOW);  }
+inline void DisableRot()   { digitalWrite(EN_ROT_PIN,   HIGH); }
+
+
+/////////////////////////////////////////////////////////////////////////////////
 // ForceInOut()
 //
 // This function steps the in/out axis IN or OUT without coordinating with the
@@ -1051,7 +1150,8 @@ void ForceInOut(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
     for (int_fast32_t x = 0; x < steps; x++)
     {
         InOutStepper.Step(DirInOut);
-        delayMicroseconds(delay);
+        // !!! Can't use delayMicroseconds() within critical section.
+        UsDelay(delay);
     }
     taskEXIT_CRITICAL();
 } // End ForceInOut().
@@ -1091,7 +1191,8 @@ void ForceRot(int_fast32_t steps, uint_fast8_t direction, uint_fast16_t delay)
     for (int_fast32_t x = 0; x < steps; x++)
     {
         RotStepper.Step(DirRot);
-        delayMicroseconds(delay);
+        // !!! Can't use delayMicroseconds() within critical section.
+        UsDelay(delay);
     }
     taskEXIT_CRITICAL();
 } // End ForceRot().
@@ -1178,18 +1279,6 @@ void Home()
     EnableInOut();
     EnableRot();
 } // End Home().
-
-
-/////////////////////////////////////////////////////////////////////////////////
-// EnableInOut(), DisableInOut(), EnableRot(), DisableRot()
-//
-// These inline functions are used to enable and disable the individual axes.
-// They take no arguments and return nothing.
-/////////////////////////////////////////////////////////////////////////////////
-inline void EnableInOut()  { digitalWrite(EN_INOUT_PIN, LOW);  }
-inline void DisableInOut() { digitalWrite(EN_INOUT_PIN, HIGH); }
-inline void EnableRot()    { digitalWrite(EN_ROT_PIN,   LOW);  }
-inline void DisableRot()   { digitalWrite(EN_ROT_PIN,   HIGH); }
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1321,9 +1410,10 @@ void ReverseKinematics(float_t newX, float_t newY)
 bool WaitForMoveComplete()
 {
     // Since all moves are broken up into small segments, no move should take
-    // very long.  If a move takes longer than 1 second, even at the lowest
-    // speed, then there is a problem.
-    const uint32_t TIMEOUT_MS = 1000;
+    // very long.  If a move takes longer than 65 seconds, even at the lowest
+    // speed, then there is a problem.  The ServoControlTask() times out after
+    // 60 seconds, so we make our timeout a little longer than that.
+    const uint32_t TIMEOUT_MS = SERVO_TIMEOUT_MS + 3000;
     const uint32_t TICK_MS = 5;
     const uint_fast32_t MOVE_TIMEOUT_TICKS = TIMEOUT_MS / TICK_MS;
     uint_fast32_t ticksLeft = MOVE_TIMEOUT_TICKS;
@@ -1332,10 +1422,10 @@ bool WaitForMoveComplete()
     // Wait for all queued moves to complete.
     // Time out if moves are queued and no motion for too long.
     while ((RotOn || InOutOn || uxQueueMessagesWaiting(PlannerQueueHandle)) &&
-           !AbortShape && --ticksLeft)
+           --ticksLeft)
     {
         // Don't time out if we're pausing or still completing a move.
-        if (Pausing || RotOn || InOutOn)
+        if (Pausing)
         {
             ticksLeft = MOVE_TIMEOUT_TICKS;
         }
@@ -1348,15 +1438,12 @@ bool WaitForMoveComplete()
     PlannerCurrentY = CurrentY;
 
     // If we timed out, then something is wrong.  Reset the queue.
-    if (!ticksLeft || AbortShape)
+    if (!ticksLeft)
     {
         xQueueReset(PlannerQueueHandle);
         xTaskNotify(ServoCtrlHandle, 0, eNoAction);
         moveComplete = false;
-        if (!ticksLeft)
-        {
-            LOG_F(LOG_INFO, "WaitForMoveComplete() timed out.\n");
-        }
+        LOG_F(LOG_ALWAYS, "!!! WaitForMoveComplete() timed out.\n");
     }
 
     return moveComplete;
@@ -1379,8 +1466,26 @@ void ServoControlTask(__unused void *param)
 
     while (1)
     {
-        if (pdPASS == xQueueReceive(PlannerQueueHandle, &data, pdMS_TO_TICKS(1000)) &&
-            !AbortShape)
+        // Handle servo reset requests.  AbortServo only gets set after the
+        // shape task has already stopped generating motion and all servos
+        // are at their last commanded position.
+        if (AbortShape || AbortServo)
+        {
+            // Turn off servos and reset the planner queue.
+            xQueueReset(PlannerQueueHandle);
+            RotOn   = false;
+            InOutOn = false;
+            
+            // If the shape task has completed its cleanup, do our cleanup
+            // and signal that we're done.
+            if (AbortServo)
+            {
+                InOutStepsTo = InOutSteps;
+                RotStepsTo   = RotSteps;
+                AbortServo = false;
+            }
+        }
+        if ((pdPASS == xQueueReceive(PlannerQueueHandle, &data, 2)) && !AbortShape)
         {
             // We don't need to protect the following code since both interrupts
             // are currently disabled via InOutOn and RotOn both being false at
@@ -1430,12 +1535,19 @@ void ServoControlTask(__unused void *param)
                 RotOn   = bRotON;
                 taskEXIT_CRITICAL();
 
-                // Wait until the target is reached or an abort is commanded.
-                // Periodically check for abort.
-                while ((xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(1000)) != pdTRUE) &&
-                       !AbortShape)
+                // Wait until the target is reached. Force the current move to
+                // end and log an error on timeout.
+                if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(SERVO_TIMEOUT_MS)) != pdTRUE)
                 {
-                    // Do nothing.
+                    // Seems to be stuck.  Force the current move to end.
+                    InOutOn = false;
+                    RotOn = false;
+                    InOutStepsTo = InOutSteps;
+                    RotStepsTo = RotSteps;
+                    CalculateXY();
+
+                    LOG_F(LOG_ALWAYS, "!!! Timeout waiting for move to complete.\n");
+                    break;
                 }
             }
         }
@@ -1795,12 +1907,12 @@ void GenerateSeriesSteps(uint_fast16_t size, uint_fast16_t &steps,
                          uint_fast16_t &sizeInc, float_t &rotInc)
 {
     // Determine how many steps to take, and how much to increase size and angle.
-    steps   = random(MIN_SERIES_STEPS, MAX_SERIES_STEPS);
+    steps   = NextRandom(MIN_SERIES_STEPS, MAX_SERIES_STEPS);
     sizeInc = (MAX_SCALE_I - size) / steps;
     sizeInc = max(sizeInc, MIN_SERIES_INC);
     steps   = 1 + (MAX_SCALE_I - size) / sizeInc;
     rotInc  = RandomFloat(-DtoR(MAX_SERIES_ANGLE), DtoR(MAX_SERIES_ANGLE));
-    LOG_F(LOG_INFO, "(%d,%d,%d,%.2f)\n", size, steps, sizeInc, RtoD(rotInc));
+    LOG_F(LOG_INFO, "(%d, %d, %d, %.2f)\n", size, steps, sizeInc, RtoD(rotInc));
 } // End GenerateSeriesSteps().
 
 
@@ -1832,7 +1944,7 @@ void Circle(uint_fast16_t numLobes, uint_fast16_t xSize,
     ySize    = constrain(ySize, MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE);
 
     // Show our call.
-    StartShape("Circle(%d,%d,%d,%.1f)\n", numLobes, xSize, ySize, RtoD(rotation));
+    StartShape("Circle(%d, %d, %d, %.1f)\n", numLobes, xSize, ySize, RtoD(rotation));
     // Loop to create the curve.
     for (uint_fast16_t i = 0; (i <= SPIRO_NUM_POINTS) && !AbortShape; i++)
     {
@@ -1853,9 +1965,9 @@ void Circle(uint_fast16_t numLobes, uint_fast16_t xSize,
 void RandomCircle()
 {
     // Generate some legal arguments for the call to Circle().
-    uint_fast16_t lobes = random(MIN_CIRCLE_LOBES, MAX_CIRCLE_LOBES + 1);
-    uint_fast16_t xSize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
-    uint_fast16_t ySize = random(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
+    uint_fast16_t lobes = NextRandom(MIN_CIRCLE_LOBES, MAX_CIRCLE_LOBES + 1);
+    uint_fast16_t xSize = NextRandom(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
+    uint_fast16_t ySize = NextRandom(MIN_CIRCLE_SIZE, MAX_CIRCLE_SIZE + 1);
     float_t       rot   = RandomFloat(0.0, PI);
 
     // Make the call to Circle().
@@ -1877,8 +1989,8 @@ void EllipseSeries()
     const uint_fast16_t MAX_LOBES = 9;   // For series, no more than 2 lobes.
 
     // Generate some legal arguments for the calls to Circle().
-    uint_fast16_t lobes  = random(MIN_LOBES, MAX_LOBES + 1);
-    uint_fast16_t xSize  = random(MIN_ELLIPSE_SIZE, MAX_SCALE_I);
+    uint_fast16_t lobes  = NextRandom(MIN_LOBES, MAX_LOBES + 1);
+    uint_fast16_t xSize  = NextRandom(MIN_ELLIPSE_SIZE, MAX_SCALE_I);
     float_t       ratio  = RandomFloat(MIN_ELLIPSE_RATIO, MAX_ELLIPSE_RATIO);
     uint_fast16_t ySize  = (uint_fast16_t)(xSize / ratio);
                   ySize  = constrain(ySize, MIN_ELLIPSE_SIZE, MAX_SCALE_I);
@@ -2015,7 +2127,7 @@ void RandomWipe()
     Home();
 
     // Select a random wipe and execute it.
-    size_t index = random(0, sizeof(Wipes) / sizeof(Wipes[0]));
+    size_t index = NextRandom(0, sizeof(Wipes) / sizeof(Wipes[0]));
     (*Wipes[index])(RandomFloat(0.0, PI));
 } // End RandomWipe().
 
@@ -2045,7 +2157,7 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
 
     // Show our call.  This may come in handy.  If an interesting path is displayed,
     // the arguments may be used again.
-    StartShape("Clover(%d,%d,%d,%d,%d)\n", fixedR, outerR, xSize, ySize, res);
+    StartShape("Clover(%d, %d, %d, %d, %d)\n", fixedR, outerR, xSize, ySize, res);
 
     // Reduce the radii values.
     Reduce(fixedR, outerR);
@@ -2103,18 +2215,18 @@ void Clover(uint_fast16_t fixedR, uint_fast16_t outerR, uint_fast16_t xSize,
 void RandomClover()
 {
     // Generate some legal arguments for the call to Clover().
-    uint_fast16_t a = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
-    uint_fast16_t b = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
+    uint_fast16_t a = NextRandom(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
+    uint_fast16_t b = NextRandom(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
 
     // Make sure our random values are not equal.
     while (a == b)
     {
-        b = random(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
+        b = NextRandom(MIN_CLOVER_VAL, MAX_CLOVER_VAL + 1);
     }
 
-    uint_fast16_t xSize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
-    uint_fast16_t ySize = random(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
-    uint_fast16_t res   = random(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
+    uint_fast16_t xSize = NextRandom(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t ySize = NextRandom(MIN_CLOVER_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t res   = NextRandom(MIN_CLOVER_RES,  MAX_CLOVER_RES) + 1;
 
     // Make the call to Clover().
     Clover(a, b, xSize, ySize, res);
@@ -2139,7 +2251,7 @@ void Heart(uint_fast16_t size, float_t rotation, uint_fast16_t res)
     res               = constrain(res, MIN_HEART_RES, MAX_HEART_RES);
     float_t baseAngle = PI_X_2 / (float_t)res;
 
-    StartShape("Heart(%d,%.1f,%d)\n", size, RtoD(rotation), res);
+    StartShape("Heart(%d, %.1f, %d)\n", size, RtoD(rotation), res);
 
     // Loop to create the heart.
     for (uint_fast16_t i = 0; (i <= res) && !AbortShape; i++)
@@ -2167,9 +2279,9 @@ void HeartSeries()
     LOG_F(LOG_INFO, "HeartSeries");
 
     // Generate some legal arguments for the calls to Heart().
-    uint_fast16_t size = random(MIN_HEART_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    uint_fast16_t size = NextRandom(MIN_HEART_SIZE, (3 * MAX_SCALE_I / 4) + 1);
     float_t       rot  = RadAngle;
-    uint_fast16_t res  = random(MIN_HEART_RES, MAX_HEART_RES + 1);
+    uint_fast16_t res  = NextRandom(MIN_HEART_RES, MAX_HEART_RES + 1);
 
     // Determine how many steps to take, and how much to increase size and angle.
     uint_fast16_t steps   = 0;
@@ -2224,7 +2336,7 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
     outLimit = constrain(outLimit, inLimit + 10, (int_fast16_t)MAX_SCALE_I);
 
     // Show our call.
-    StartShape("MotorRatios(%.1f,%d,%d,%d)\n", ratio, multiplePoints, inLimit, outLimit);
+    StartShape("MotorRatios(%.1f, %d, %d, %d)\n", ratio, multiplePoints, inLimit, outLimit);
 
     // Convert our in out units to in/out motor steps.
     InLimit  = ((int_fast32_t)inLimit  * (int_fast32_t)INOUT_TOTAL_STEPS) /
@@ -2260,9 +2372,6 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
         }
     }
 
-    // Get ready to do the move by setting the points count.
-    MRPointCount = cycles;
-
     // Select the direction based on our current position.  If we're closer to
     // the positive limit, then go in.  Otherwise go out.
     if (InOutSteps > INOUT_TOTAL_STEPS / 2)
@@ -2282,6 +2391,9 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
 
     // Start the move by turning the motors on atomically.
     taskENTER_CRITICAL();
+    // Get ready to do the move by setting the points count.
+    MRPointCount = cycles;
+    MRInProcess  = true;
     RotOn   = true;
     InOutOn = true;
     taskEXIT_CRITICAL();
@@ -2304,12 +2416,26 @@ void MotorRatios(float_t ratio, bool multiplePoints, int_fast16_t inLimit,
             }
         }
     }
+    // MotorRatios moves are handled differently from other moves.  A move is
+    // started, and it may not complete till several minutes later.  If an
+    // abort has been commanded, we want to trick the motor ISRs into thinking
+    // they have completed the current move.  We do this by turning the motors
+    // off and resetting the servo counters.
+    if (AbortShape)
+    {
+        // Turn the servos off and reset the servo counters.
+        InOutOn = false;
+        RotOn = false;
+        InOutStepsTo = InOutSteps;
+        RotStepsTo = RotSteps;
+    }
 
     // Restore the default in/out limits and speed factors.
+    MRPointCount = 0;
+    MRInProcess = false;
     InLimit  = 0;
     OutLimit = MAX_SCALE_I;
     SetSpeedFactors(1.0, 1.0);
-    CalculateXY();       // Update our current position variables.
     EndShape();
 } // End MotorRatios().
 
@@ -2357,8 +2483,8 @@ void RandomRatiosRing()
         ratio = RandomFloat(0.1 / (MAX_MOTOR_RATIO / 3.0), 1.0);
     }
 
-    int_fast16_t inLimit  = random(0, (int_fast16_t)(0.8 * MAX_SCALE_F) + 1);
-    int_fast16_t outLimit = random(inLimit + 10, (int_fast16_t)MAX_SCALE_I + 1);
+    int_fast16_t inLimit  = NextRandom(0, (int_fast16_t)(0.8 * MAX_SCALE_F) + 1);
+    int_fast16_t outLimit = NextRandom(inLimit + 10, (int_fast16_t)MAX_SCALE_I + 1);
 
     // Make the call to MotorRatios().
     MotorRatios(ratio, true, inLimit, outLimit);
@@ -2393,7 +2519,7 @@ void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate,
                     const char *pName)
 {
     // Show our call.
-    StartShape("PlotShapeArray(%s,%d,%d)\n", pName, size, rotate);
+    StartShape("PlotShapeArray(%s, %d, %d)\n", pName, size, rotate);
 
     // Rotate our shape so that the start point is as close as possible to the
     // current ball position.
@@ -2455,7 +2581,7 @@ void PlotShapeArray(const Coordinate shape[], uint_fast16_t size, bool rotate,
 void RandomPlot()
 {
     // Select a random one and execute it.
-    size_t index = random(0, sizeof(Plots) / sizeof(Plots[0]));
+    size_t index = NextRandom(0, sizeof(Plots) / sizeof(Plots[0]));
     PlotShapeArray(Plots[index].m_Plot, Plots[index].m_Size, Plots[index].m_Rotate,
                    Plots[index].m_pName);
 } // End RandomPlot().
@@ -2477,7 +2603,7 @@ void Polygon(uint_fast16_t numSides, uint_fast16_t size, float_t rotation)
     numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
     float_t scale = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
-    StartShape("Polygon(%d,%d,%.1f)\n", numSides, size, RtoD(rotation));
+    StartShape("Polygon(%d, %d, %.1f)\n", numSides, size, RtoD(rotation));
 
     // Loop to create the (possibly rotated) polygon.
     for (uint_fast16_t i = 0; (i <= numSides) && !AbortShape; i++)
@@ -2499,8 +2625,8 @@ void PolygonSeries()
     LOG_F(LOG_INFO, "PolygonSeries");
 
     // Generate some legal arguments for the calls to Polygon().
-    uint_fast16_t sides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint_fast16_t size  = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    uint_fast16_t sides = NextRandom(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size  = NextRandom(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
     float_t       rot   = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and angle.
@@ -2536,7 +2662,7 @@ void PolygonSeries()
 void PolyVector(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
                 std::vector<FloatCoordinate> &v)
 {
-    LOG_F(LOG_INFO, "PolyVector(%d,%f.1,%f.1,0x%x)\n", numSides, size, rotation, v);
+    LOG_F(LOG_INFO, "PolyVector(%d, %d, %.1f)\n", numSides, size, RtoD(rotation));
 
     // Make sure we start with an empty vector.
     v.clear();
@@ -2637,13 +2763,13 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
             // Target is the next mouse in order (with wrap-around).
             uint_fast16_t target = (i + 1) % n;
             GotoXY(mice[target].x, mice[target].y);
-            LOG_F(LOG_DEBUG, "GotoXY: %f.1   %f.1\n", mice[target].x, mice[target].y);
+            LOG_F(LOG_DEBUG, "GotoXY: %.1f   %.1f\n", mice[target].x, mice[target].y);
 
             // Calculate direction vector for the next move.
             float_t dx = mice[target].x - mice[i].x;
             float_t dy = mice[target].y - mice[i].y;
             float_t distance = sqrtf(dx * dx + dy * dy);
-            LOG_F(LOG_DEBUG, "dx: %f.2   dy: %f.2   delta: %f.2\n", dx, dy, distance);
+            LOG_F(LOG_DEBUG, "dx: %.2f   dy: %.2f   delta: %.2f\n", dx, dy, distance);
 
             // Termination condition: reached the center.
             if (distance < speed + 1.0)
@@ -2684,17 +2810,21 @@ void Whirl(float_t speed, std::vector<FloatCoordinate> &startVector)
 void WhirlFlower(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
                  float_t speed)
 {
-    StartShape("WhirlFlower(%d,%f.1,%f.1)\n", numSides, size, rotation);
-
     // Make sure all arguments are within valid limits.
-    numSides      = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
-    float_t scale = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+    numSides = constrain(numSides, MIN_POLY_SIDES, MAX_POLY_SIDES);
+    size     = constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
+
+    StartShape("WhirlFlower(%d, %d, %.1f, %.1f)\n", numSides, size, RtoD(rotation),
+                speed);
 
     std::vector<FloatCoordinate> v;
     for (uint_fast16_t i = 0; (i < numSides) && !AbortShape; i++)
     {
-      WhirlLeafVector(numSides, scale, rotation + i * PI_X_2 / numSides, v);
-      Whirl(speed, v);
+        float_t rot = rotation + i * PI_X_2 / numSides;
+        StartShape("Whirl(%d, %d, %.1f, %.1f)\n", numSides, size, RtoD(rot), speed);
+        WhirlLeafVector(numSides, size, rot, v);
+        Whirl(speed, v);
+        EndShape(false);
     }
     // Make the last petal look the same as the other ones by returning to
     // the origin.
@@ -2715,10 +2845,10 @@ void WhirlFlower(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
 void RandomWhirlFlower()
 {
     // Generate some random parameters.
-    uint_fast16_t numSides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint_fast16_t size     = random(MIN_POLY_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t numSides = NextRandom(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size     = NextRandom(MIN_POLY_SIZE, MAX_SCALE_I + 1);
     float_t rotation       = RadAngle;
-    float_t speed          = random(4.0, size / 4);
+    float_t speed          = NextRandom(4.0, size / 4);
 
     WhirlFlower(numSides, size, rotation, speed);
 } // End RandomWhirlFlower().
@@ -2732,14 +2862,15 @@ void RandomWhirlFlower()
 void RandomWhirlPoly()
 {
     // Generate some random parameters.
-    uint_fast16_t numSides = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint_fast16_t size     = random(MIN_POLY_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t numSides = NextRandom(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size     = NextRandom(MIN_POLY_SIZE, MAX_SCALE_I + 1);
     float_t rotation       = RadAngle;
-    float_t speed          = random(4.0, size / 4);
+    float_t speed          = NextRandom(4.0, size / 4);
 
     // Generate the path, then display the whirl.
     std::vector<FloatCoordinate> v;
-    StartShape("WhirlPoly(%d,%d,%f.1,%f.1\n",numSides, size, rotation, speed);
+    StartShape("WhirlPoly(%d, %d, %.1f, %.1f)\n", numSides, size, RtoD(rotation),
+                speed);
     PolyVector(numSides, size, rotation, v);
     Whirl(speed, v);
 
@@ -2760,15 +2891,17 @@ void RandomLines()
     StartShape("RandomLines()\n");
 
     // Determine how many lines to generate.
-    uint_fast16_t numPoints = random(MIN_RANDOM_POINTS, MAX_RANDOM_POINTS);
+    uint_fast16_t numPoints = NextRandom(MIN_RANDOM_POINTS, MAX_RANDOM_POINTS);
 
     // Generate the random lines.
     for (uint_fast16_t i = numPoints; i; i--)
     {
         LOG_F(LOG_CYCLES, "%d\n", i);
 
-        GotoXY(random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1),
-               random(-(int_fast16_t)MAX_SCALE_I, (int_fast16_t)MAX_SCALE_I + 1));
+        float_t angle  = RandomFloat(0.0, PI_X_2);
+        float_t length = RandomFloat(0.0, MAX_SCALE_F);
+
+        GotoXY(cosf(angle) * length, sinf(angle) * length);
     }
     EndShape();
 } // End RandomLines().
@@ -2798,7 +2931,7 @@ void Rose(uint_fast16_t num, uint_fast16_t denom, uint_fast16_t xSize,
     res   = constrain(res,   MIN_ROSE_RES, MAX_ROSE_RES);
 
     // Show our call.
-    StartShape("Rose(%d,%d,%d,%d,%d)\n", num, denom, xSize, ySize, res);
+    StartShape("Rose(%d, %d, %d, %d, %d)\n", num, denom, xSize, ySize, res);
 
     Reduce(num, denom);
 
@@ -2836,18 +2969,18 @@ void Rose(uint_fast16_t num, uint_fast16_t denom, uint_fast16_t xSize,
 void RandomRose()
 {
     // Generate some legal arguments for the call to Rose().
-    uint_fast16_t n = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
-    uint_fast16_t d = random(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
+    uint_fast16_t n = NextRandom(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
+    uint_fast16_t d = NextRandom(MIN_ROSE_VAL, MAX_ROSE_VAL + 1);
 
     // Make sure our random values are not equal.
     while (d == n)
     {
-        d = random(MIN_ROSE_VAL, MAX_ROSE_VAL);
+        d = NextRandom(MIN_ROSE_VAL, MAX_ROSE_VAL);
     }
 
-    uint_fast16_t xSize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
-    uint_fast16_t ySize = random(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
-    uint_fast16_t res   = random(MIN_ROSE_RES,MAX_ROSE_RES + 1 );
+    uint_fast16_t xSize = NextRandom(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t ySize = NextRandom(MIN_ROSE_SIZE, MAX_SCALE_I + 1);
+    uint_fast16_t res   = NextRandom(MIN_ROSE_RES,MAX_ROSE_RES + 1 );
 
     // Make the call to Rose().
     Rose(n, d, xSize, ySize, res);
@@ -2893,7 +3026,7 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r,
     points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph(%d,%d,%d,%.2f,%.2f,%d)\n",
+    StartShape("Spirograph(%d, %d, %d, %.2f, %.2f, %d)\n",
                 fixedR, r, a, xScale, yScale, points);
 
     xScale *= a;
@@ -2944,27 +3077,27 @@ void Spirograph (uint_fast16_t fixedR, uint_fast16_t r,
 void RandomSpirograph()
 {
     // Generate some random legal arguments for the call to Spirograph().
-    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, (9 * MAX_SCALE_I) / 10);
-    uint_fast16_t r      = random(MIN_SPIRO_SMALLR, fixedR - 5);
-    uint_fast16_t a      = random(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
+    uint_fast16_t fixedR = NextRandom(MIN_SPIRO_FIXEDR, (9 * MAX_SCALE_I) / 10);
+    uint_fast16_t r      = NextRandom(MIN_SPIRO_SMALLR, fixedR - 5);
+    uint_fast16_t a      = NextRandom(MIN_SPIRO_SMALLR, MAX_SCALE_I / 2);
     float_t       xscale = 1.0;
     float_t       yscale = 1.0;
     uint_fast16_t points = SPIRO_NUM_POINTS;
 
     // Very rarely we want to scale the shape differently.
-    if (random(0, 100) > 95)
+    if (NextRandom(0, 100) > 95)
     {
         xscale = RandomFloat(-10.0, 10.0);
     }
-    if (random(0, 100) > 95)
+    if (NextRandom(0, 100) > 95)
     {
         yscale = RandomFloat(-10.0, 10.0);
     }
 
     // Very infrequently we want to reduce the points just for a change.
-    if (random(0, 100) > 95)
+    if (NextRandom(0, 100) > 95)
     {
-        points = random(3, SPIRO_NUM_POINTS / 10);
+        points = NextRandom(3, SPIRO_NUM_POINTS / 10);
     }
 
     // Make the call to RandomSpirographScaled().
@@ -2998,7 +3131,7 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
     points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("Spirograph2(%d,%d,%d,%d,%d)\n", fixedR, r1, r2, d, points);
+    StartShape("Spirograph2(%d, %d, %d, %d, %d)\n", fixedR, r1, r2, d, points);
 
     float_t revAngle = PI_X_2 / (float_t)points;
     float_t rDiff      = fixedR - r1;  // Difference between fixed radius and r1.
@@ -3059,16 +3192,16 @@ void Spirograph2(uint_fast16_t fixedR, uint_fast16_t r1, uint_fast16_t r2,
 void RandomSpirograph2()
 {
     // Generate some legal arguments for the call to Spirograph2().
-    uint_fast16_t fixedR = random(MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10) + 1);
-    uint_fast16_t r1     = random(MIN_SPIRO_SMALLR, fixedR - 2);
-    uint_fast16_t r2     = random(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
-    uint_fast16_t d      = random(1, MAX_SCALE_I + 1);
+    uint_fast16_t fixedR = NextRandom(MIN_SPIRO_FIXEDR, (8 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t r1     = NextRandom(MIN_SPIRO_SMALLR, fixedR - 2);
+    uint_fast16_t r2     = NextRandom(MIN_SPIRO_SMALLR, max(MIN_SPIRO_SMALLR + 1, r1 - 7));
+    uint_fast16_t d      = NextRandom(1, MAX_SCALE_I + 1);
     uint_fast16_t points = SPIRO_NUM_POINTS;
 
     // Very infrequently we want to reduce the points just for a change.
-    if (random(0, 100) > 95)
+    if (NextRandom(0, 100) > 95)
     {
-        points = random(3, SPIRO_NUM_POINTS / 10);
+        points = NextRandom(3, SPIRO_NUM_POINTS / 10);
     }
 
     // Make the call to Spirograph2().
@@ -3099,7 +3232,7 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
     points = constrain(points, 3, SPIRO_NUM_POINTS);
 
     // Show our call.
-    StartShape("SpirographWithSquare(%d,%d,%d,%d)\n", fixedR, s, d, points);
+    StartShape("SpirographWithSquare(%d, %d, %d, %d)\n", fixedR, s, d, points);
 
     // Calculate the radius of the path traced by the center of the square.
     // Center of the square will move along a circle of radius (FIXED_R - s / 2).
@@ -3168,15 +3301,15 @@ void SpirographWithSquare(uint_fast16_t fixedR, uint_fast16_t s, uint_fast16_t d
 void RandomSpirographWithSquare()
 {
     // Generate some legal arguments for the call to SpirographWithSquare().
-    uint_fast16_t fixedR = random(MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10) + 1);
-    uint_fast16_t s      = random(1, fixedR / 2 - 1);
-    uint_fast16_t d      = random(1, MAX_SCALE_I);
+    uint_fast16_t fixedR = NextRandom(MAX_SCALE_I / 5, (9 * MAX_SCALE_I / 10) + 1);
+    uint_fast16_t s      = NextRandom(1, fixedR / 2 - 1);
+    uint_fast16_t d      = NextRandom(1, MAX_SCALE_I);
     uint_fast16_t points = SPIRO_NUM_POINTS;
 
     // Very infrequently we want to reduce the points just for a change.
-    if (random(0, 100) > 95)
+    if (NextRandom(0, 100) > 95)
     {
-        points = random(3, SPIRO_NUM_POINTS / 10);
+        points = NextRandom(3, SPIRO_NUM_POINTS / 10);
     }
 
     // Make the call to SpirographWithSquare().
@@ -3203,7 +3336,7 @@ void Star(uint_fast16_t numPoints, float_t ratio, uint_fast16_t size,
     ratio = constrain(ratio, MIN_STAR_RATIO, MAX_STAR_RATIO);
     size = (float_t)constrain(size, MIN_POLY_SIZE, MAX_SCALE_I);
 
-    StartShape("Star(%d,%.1f,%d,%.1f)\n", numPoints, ratio, size, RtoD(rotation));
+    StartShape("Star(%d, %.1f, %d, %.1f)\n", numPoints, ratio, size, RtoD(rotation));
 
     // Loop to create the (possibly rotated) star.
     for (uint_fast16_t i = 0; (i <= numPoints * 2) && !AbortShape; i++)
@@ -3226,9 +3359,9 @@ void StarSeries()
     LOG_F(LOG_INFO, "StarSeries");
 
     // Generate some legal arguments for the calls to Star().
-    uint_fast16_t points = random(MIN_STAR_POINTS + 1, MAX_STAR_POINTS / 3);
+    uint_fast16_t points = NextRandom(MIN_STAR_POINTS + 1, MAX_STAR_POINTS / 3);
     float_t       ratio  = RandomFloat(MIN_STAR_RATIO, MAX_STAR_RATIO);
-    uint_fast16_t size   = random(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
+    uint_fast16_t size   = NextRandom(MIN_POLY_SIZE, (3 * MAX_SCALE_I / 4) + 1);
     float_t       rot    = RadAngle;
 
     // Determine how many steps to take, and how much to increase size and angle.
@@ -3271,7 +3404,7 @@ void SuperStar(uint_fast16_t numNodes, uint_fast16_t size, bool outline,
     float_t angle = rotation;
 
     // Show our call.
-    StartShape("SuperStar(%d,%d,%d,%.1f)\n", numNodes, size, outline, RtoD(rotation));
+    StartShape("SuperStar(%d, %d, %d, %.1f)\n", numNodes, size, outline, RtoD(rotation));
 
     // If we are drawing a perimeter, then initial skip is 1.  Otherwise it is 2.
     uint_fast16_t initialSkip = (outline || (numNodes <= 4)) ? 1 : 2;
@@ -3332,8 +3465,8 @@ void SuperStar(uint_fast16_t numNodes, uint_fast16_t size, bool outline,
 void RandomSuperStar()
 {
     // Generate some legal arguments for the call to SuperStar().
-    uint_fast16_t numPoints = random(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
-    uint_fast16_t size      = random(MAX_SCALE_I / 2, MAX_SCALE_I + 1);
+    uint_fast16_t numPoints = NextRandom(MIN_POLY_SIDES, MAX_POLY_SIDES + 1);
+    uint_fast16_t size      = NextRandom(MAX_SCALE_I / 2, MAX_SCALE_I + 1);
     bool          outline   = RandomBool();
     float_t       rot       = RadAngle;
 
@@ -3485,11 +3618,11 @@ void PrintTask(__unused void *param)
     SerialLogFreeRTOS log(MAX_LOG_STRING_SIZE * PRINT_QUEUE_SIZE, q);
     char *pData;
 
-    // Wait to receive an outgoing message request, then send it out the serial port.
+    // Wait to receive an outgoing message request, then send it out the serial
+    // port.  There is no reason to check for timeout.
     while (1)
     {
-        const uint_fast32_t PRINT_TIMEOUT_MS = 10000;
-        if (xQueueReceive(q, &pData, pdMS_TO_TICKS(PRINT_TIMEOUT_MS)) == pdPASS)
+        if (xQueueReceive(q, &pData, portMAX_DELAY) == pdPASS)
         {
             Serial.print(pData);
         }
@@ -3504,56 +3637,53 @@ void PrintTask(__unused void *param)
 /////////////////////////////////////////////////////////////////////////////////
 void ShapeTask(__unused void *param)
 {
-    // Delay before starting the task to give the print task time to start up.
+    // Delay before starting the task to give the all tasks time to start up.
     vTaskDelay(pdMS_TO_TICKS(3000));
-
-    // Home the axes.
-    Home();
-
-    // Looks like each task may use a different seed for the random number
-    // generator (RNG)???  Calling randomSeed(RandomSeed) from setup does not
-    // seem to affect this task.  To work around this, we re-seed  the RNG at
-    // the start of this task which is the only task that uses random numbers.
-    randomSeed(RandomSeed);
-    LOG_F(LOG_ALWAYS, "Seed = %u\n", RandomSeed);
-
-    // On startup we wipe the board only if the brightness is not currently
-    // set extremely low.  This allows us to skip the lengthy wiping process if
-    // we have already shaken the table, or cleared it via some other means.
-    if (Brightness < 10)
-    {
-        ClearFromIn();
-    }
-
-    // Display my initials.
-    // *** Change this as desired.  It is the power-up greeting. ***
-    RotateToAngle(atan2f((float_t)JMCPlot[0].y, (float_t)JMCPlot[0].x));
-    PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false, "JMCPlot");
-
-    // Inform the rest that we're up and running.
-    GeneratingShapes = true;
 
     // Loop forever since tasks must never return.
     while (1)
     {
-        // Generate a random shape.
-        GenerateRandomShape();
-
-        // If we were aborting the previous shape, we're done now.
+        // If we were aborting the previous shape, we need to wait for motion
+        // to stop.
         if (AbortShape)
         {
-            xQueueReset(PlannerQueueHandle);
-            AbortShape = false;
+            const TickType_t MAX_ABORT_DELLAY =
+                             pdMS_TO_TICKS(SERVO_TIMEOUT_MS + 3000);
+            RotOn   = false;
+            InOutOn = false;
             WaitForMoveComplete();
+
+            // Tell ServoControlTask() to abort any existing motion, and wait
+            // for it to say it's done.
+            AbortServo = true;
+            TickType_t startTime = xTaskGetTickCount();
+            while (AbortServo &&
+                   ((xTaskGetTickCount() - startTime) < MAX_ABORT_DELLAY))
+            {
+                if (Pausing)
+                {
+                    startTime = xTaskGetTickCount();
+                }
+                vTaskDelay(1);
+            }
+            if (xTaskGetTickCount() - startTime >= MAX_ABORT_DELLAY)
+            {
+                LOG_F(LOG_ALWAYS, "!!!! Timeout waiting for ServoTask() to clear.\n");
+            }
+            AbortShape = false;
         }
 
-        // Start over with a clean board if the random seed has changed.
+        // Start over if the random seed has changed.
         if (RandomSeedChanged)
         {
-            // Since randomSeed() seems to be task specific, update it now.
-            randomSeed(RandomSeed);
-            ResetShapes();
+            LOG_F(LOG_ALWAYS, "RNG Seed Changed to %u\n", RandomSeed);
+
+            // Lock out some remote commands until we're ready to handle them.
+            GeneratingShapes = false;
+
+            // Home the axes and reset our statistics.
             Home();
+            ResetShapes();
 
             // Only wipe the board if the user wants it as indicated by a low
             // brightness setting.
@@ -3561,8 +3691,20 @@ void ShapeTask(__unused void *param)
             {
                 ClearFromIn();
             }
+
+            // Display my initials.
+            // *** Change this as desired.  It is the power-up greeting. ***
+            RotateToAngle(atan2f((float_t)JMCPlot[0].y, (float_t)JMCPlot[0].x));
+            PlotShapeArray(JMCPlot, sizeof(JMCPlot) / sizeof(JMCPlot[0]), false, "JMCPlot");
+
+            // Seed the RNG with the new value.
+            SetRandomSeed(RandomSeed);
             RandomSeedChanged = false;
         }
+
+        // Generate a random shape.
+        GeneratingShapes = true;
+        GenerateRandomShape();
     }
 } // End ShapeTask().
 
@@ -3633,9 +3775,8 @@ void setup()
     add_alarm_in_us(1000000, RotaryServoIsr, NULL, true);
     add_alarm_in_us(1000000, InOutServoIsr,  NULL, true);
 
-    // Seed the random number generator.
+    // Generate a seed the random number generator.  It will be applied later.
     RandomSeed = get_rand_32();
-    randomSeed(RandomSeed);
 
     // Display the random number.  It may be used in the future to repeat an
     // interesting sequence.  We can't use LOG_F yet since it gets initialized in
@@ -3648,10 +3789,13 @@ void setup()
     Brightness        = BRIGHTNESS_MIN_VAL;
     RemoteBrightness  = false;
     RemotePause       = false;
-    AbortShape        = false;
+    AbortShape        = true;
+    AbortServo        = false;
     ShapeIteration    = 0;
-    RandomSeedChanged = false;
+    RandomSeedChanged = true;
     GeneratingShapes  = false;
+    MRPointCount      = 0;
+    MRInProcess       = false;
     ResetShapes();
 
     // Initialize our weighted random object with probabilities specified in
@@ -3680,14 +3824,14 @@ void setup()
     xTaskCreate(PrintTask, "Print", 4096, NULL, 2, &PrintHandle);
     vTaskCoreAffinitySet(PrintHandle, 1 << 1);
 
-    // Create the task to generatse motion.  It will run on core 0.
-    xTaskCreate(ShapeTask, "Path", 8192, NULL, 5, &ShapeHandle);
-    vTaskCoreAffinitySet(ShapeHandle, 1 << 0);
-
     // Create the planner which interfaces to the servo ISR's.
     // It will run on core 0 at a high priority.
     xTaskCreate(ServoControlTask, "Servo", 8192, NULL, 6, &ServoCtrlHandle);
     vTaskCoreAffinitySet(ServoCtrlHandle, 1 << 0);
+
+    // Create the task to generatse motion.  It will run on core 0.
+    xTaskCreate(ShapeTask, "Shape", 8192, NULL, 5, &ShapeHandle);
+    vTaskCoreAffinitySet(ShapeHandle, 1 << 0);
 
     // Save initial ticks.  This should normally be near zero, but we don't want
     // to rely on that, just in case it is different for some reason.
@@ -3790,7 +3934,7 @@ int64_t RotaryServoIsr(__unused alarm_id_t id, __unused void *user_data)
             {
                 InOutOn = false;
             }
-            if (!RotOn && !InOutOn)
+            if (!RotOn && !InOutOn && !MRInProcess)
             {
                 xTaskNotifyFromISR(ServoCtrlHandle, 0, eNoAction, &taskWoken);
             }
@@ -3841,7 +3985,7 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
             if (InOutSteps == InOutStepsTo)
             {
                 InOutOn = false;
-                if (!RotOn)
+                if (!RotOn && !MRInProcess)
                 {
                     xTaskNotifyFromISR(ServoCtrlHandle, 0, eNoAction, &taskWoken);
                 }
@@ -3869,7 +4013,7 @@ int64_t InOutServoIsr(__unused alarm_id_t id, __unused void *user_data)
 
             // If we're creating multiple points and the direction has changed,
             // deccrement the points count and notify the shape task that we're
-            //done.
+            // done.
             if (LastInOutDir != DirInOut)
             {
                 if (--MRPointCount == 0)
