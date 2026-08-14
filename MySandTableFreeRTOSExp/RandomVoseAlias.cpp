@@ -13,7 +13,12 @@
  *
  *                 http://www.keithschwarz.com/darts-dice-coins/
  *
- * Converted to C++ by Joe Corrbett 28-JUL-2025.
+ * History:
+ * - 28-JUL-2025 Joe Corbett (JMC)
+ *   - Converted to C++.
+ * - 04-AUG-2026 JMC
+ *   - Added m_pNextRandom function pointer so that the class could be used
+ *     in various applications.
  *******************************************************************************/
 #include <Arduino.h>            // For random().
 #include "RandomVoseAlias.h"    // For RandomVoseAlias class.
@@ -124,10 +129,10 @@ int RandomVoseAlias::Next()
     }
 
     /* Generate a fair die roll to determine which column to inspect. */
-    int column = random(0, m_Probability.size());
+    int column = (*m_pNextRandom)(0, m_Probability.size());
 
     /* Generate a biased coin toss to determine which option to pick. */
-    float_t rnd = (float_t)random(0, PROBABILITY_RESOLUTION) / (float_t)PROBABILITY_RESOLUTION;
+    float_t rnd = (float_t)(*m_pNextRandom)(0, PROBABILITY_RESOLUTION) / (float_t)PROBABILITY_RESOLUTION;
     bool coinToss = rnd < m_Probability[column];
 
     /* Based on the outcome, return either the column or its m_Alias. */

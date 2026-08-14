@@ -13,10 +13,18 @@
  *
  *                 http://www.keithschwarz.com/darts-dice-coins/
  *
- * Converted to C++ by Joe Corrbett 28-JUL-2025.
+ * History:
+ * - 28-JUL-2025 Joe Corbett (JMC)
+ *   - Converted to C++.
+ * - 04-AUG-2026 JMC
+ *   - Added m_pNextRandom function pointer so that the class could be used
+ *     in various applications.
  *******************************************************************************/
 #include <vector>
 #include <deque>
+
+typedef int32_t (*NextRng_t)(int32_t, int32_t);
+
 
 class RandomVoseAlias
 {
@@ -25,7 +33,7 @@ public:
      * Constructs a new new instance .  Requires a call to Init() before the
      * instance can be used.
      ***************************************************************************/
-    RandomVoseAlias() : m_InitDone(false) {}
+    RandomVoseAlias(NextRng_t pRng) : m_pNextRandom(pRng), m_InitDone(false) {}
 
 
     /****************************************************************************
@@ -59,6 +67,7 @@ public:
 
 private:
     /* The m_Probability and m_Alias tables. */
+    NextRng_t            m_pNextRandom;      // Pointer to random generator function.
     std::vector<int>     m_Alias;            // Alias vector.
     std::vector<float_t> m_Probability;      // Probability vector.
     bool                 m_InitDone;         // False until initialization is complete.
