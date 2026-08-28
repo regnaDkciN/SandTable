@@ -21,6 +21,13 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 28-AUG-2026 JMC
+//   - Reworked home() operation to reduce strain on the servos.
+//   - Added missing WaitForMoveComplete() calls after GotoXY().  Was causing
+//     lockup after WhirlFlower() followed by MotorRatios() call.
+//   - Abort shape on move timeout.
+//   - Improved statistics display.
+//   - Added averaging of read pot values.
 // - 14-AUG-2026 JMC
 //   - Replaced use of delayMicroseconds() with UsDelay().  The latest version
 //     of the compiler doesn't allow delayMicroseconds() to be called within
@@ -159,10 +166,11 @@
 /////////////////////////////////////////////////////////////////////////////////
 // User settable constants.
 /////////////////////////////////////////////////////////////////////////////////
-#define PAUSE_ON_DONE  false // Set to 'true' to pause when drawing finishes.
-#define ROT_CAUSING_IN CCW   // Set to 'CW' if clockwise rotation causes IN movement.
-                             // Set to 'CCW' if counter clockwise rotation causes IN movement.
-#define USE_HOME_SENSOR true // Set to 'true' if using rotary home sensor.
+#define PAUSE_ON_DONE  false  // Set to 'true' to pause when drawing finishes.
+#define ROT_CAUSING_IN CCW    // Set to 'CW' if clockwise rotation causes IN movement.
+                              // Set to 'CCW' if counter clockwise rotation causes IN movement.
+#define USE_HOME_SENSOR true  // Set to 'true' if using rotary home sensor.
+#define USE_HARD_HOMING false // Set to 'true' if hard homing is desired.
 
 // GPIO pin assignments.
 const int EN_INOUT_PIN       = 8;           // Y azis (in/out) enable pin.
@@ -572,6 +580,104 @@ private:
     uint_fast16_t m_LastCycle;   // Iteration that we last executed.
     uint_fast32_t m_Count;       // Count of number of times we executed.
 }; // End class ShapeInfo.
+
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// class LowPassFilter
+//
+// This class implements a simple low pass filter.
+/////////////////////////////////////////////////////////////////////////////////
+class LowPassFilter
+{
+public:
+    /////////////////////////////////////////////////////////////////////////////
+    // constructor
+    //
+    // Constructor for the low pass filter.
+    //
+    // Arguments:
+    //   - z :  Determines how long it takes for a change in value to be seen.
+    //          Smaller values take longer.  Valid values range from
+    //          MIN_Z to MAX_Z.  Values outside this range will be limited to
+    //          the coresponding minimum or maximum value.
+    //   - avg: The initial average value.  Defaults to 0.0 if not given.
+    /////////////////////////////////////////////////////////////////////////////
+    LowPassFilter(float_t z, float_t avg = 0.0) : m_z(SetZ(z)), m_avg(avg) {}
+
+    // Minimum and maximum z values.
+    const float_t MIN_Z = 0.000001;
+    const float_t MAX_Z = 0.999999;
+
+    /////////////////////////////////////////////////////////////////////////////
+    // AddSample()
+    //
+    // Adds a sample to the filter and returns the resulting average value.
+    //
+    // Arguments:
+    //   - s : The sample value to be added to the filter.
+    //
+    // Returns the resultant average after adding the new sample.
+    /////////////////////////////////////////////////////////////////////////////
+    float_t AddSample(float_t s)
+    {
+        m_avg = (m_z * s) + (1.0 - m_z) * m_avg;
+        return m_avg;
+    } // End AddSample().
+
+
+    /////////////////////////////////////////////////////////////////////////////
+    // Average()
+    //
+    // Returns the current average value.
+    /////////////////////////////////////////////////////////////////////////////
+    float_t Average() { return m_avg; }
+
+
+    /////////////////////////////////////////////////////////////////////////////
+    // SetZ()
+    //
+    // Sets the z value.  Limits the new value to the valid range.
+    //
+    // Arguments:
+    //   - z :  Determines how long it takes for a change in value to be seen.
+    //          Smaller values take longer.  Valid values range from
+    //          MIN_Z to MAX_Z.  Values outside this range will be limited to
+    //          the coresponding minimum or maximum value.
+    //
+    // Returns the new (possibly limited) z value.
+    /////////////////////////////////////////////////////////////////////////////
+    float_t SetZ(float_t z)
+    {
+        if (z < MIN_Z)
+        {
+            z = MIN_Z;
+        }
+        else if (z > MAX_Z)
+        {
+            z = MAX_Z;
+        }
+        m_z = z;
+        return m_z;
+    } // End SetZ().
+
+
+    /////////////////////////////////////////////////////////////////////////////
+    // GetZ()
+    //
+    // Returns the current z value.
+    /////////////////////////////////////////////////////////////////////////////
+    float_t GetZ() { return m_z; }
+
+private:
+    LowPassFilter();        // Unimplemented - forbid use.
+
+    float_t m_z;            // Determines how long it takes for a change in
+                            // value to be seen.  Smaller values take longer.
+    float_t m_avg;          // The running average value.
+
+}; // End class LowPassFilter.
+
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1223,12 +1329,21 @@ void Home()
         RotOn = false;
         InOutOn = false;
 
+#if USE_HARD_HOMING
         // Move the in/out axis first, all the way out.
         DirInOut = OUT;
         ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY);
 
         // Disable in/out to eliminate clicking on CW move.
         DisableInOut();
+#else
+        // Move the in/out axis all the way out by turning the rotary axis
+        // clockwise 3 complete turns.  This puts less strain on the servos and
+        // gears than the original method of ramming the in/out axis out all
+        // the way.
+        DirRot = CW;
+        ForceRot(ROT_TOTAL_STEPS * 3, DirRot, MIN_FORCE_DELAY * 2);
+#endif
 
         // If already on the home position, rotate  CCW till we're past it.
         DirRot = CCW;
@@ -1251,9 +1366,12 @@ void Home()
         ForceRot(HOME_ROT_OFFSET, DirRot, MIN_FORCE_DELAY * 2);
     } // End USE_HOME_SENSOR.
 
-    // Retract the inout axis all the way (to zero).
+    // Retract the in/out axis all the way (to zero).  Since we just rotated CCW,
+    // the in/out has moved in.  Compensate for it by subtracting an appropriate
+    // amount from INOUT_TOTAL_STEPS to reduce stress on servos and gears.
     DirInOut = IN;
-    ForceInOut(INOUT_TOTAL_STEPS, DirInOut, MIN_FORCE_DELAY * 2);
+    ForceInOut(INOUT_TOTAL_STEPS - (HOME_ROT_OFFSET / GEAR_RATIO / 2),
+               DirInOut, MIN_FORCE_DELAY * 2);
 
     // We are now at position (0, 0).  Update our position related variables.
     CurrentX        = 0.0;
@@ -1475,7 +1593,7 @@ void ServoControlTask(__unused void *param)
             xQueueReset(PlannerQueueHandle);
             RotOn   = false;
             InOutOn = false;
-            
+
             // If the shape task has completed its cleanup, do our cleanup
             // and signal that we're done.
             if (AbortServo)
@@ -1547,6 +1665,11 @@ void ServoControlTask(__unused void *param)
                     CalculateXY();
 
                     LOG_F(LOG_ALWAYS, "!!! Timeout waiting for move to complete.\n");
+
+                    // Something has gone terribly wrong.  Attempt to recover
+                    // by aborting the current move.
+                    AbortShape = true;
+
                     break;
                 }
             }
@@ -1641,6 +1764,7 @@ void RotateGotoXY(float_t targetX, float_t targetY, float_t angle)
 
     // Move to the (possibly rotated) target location.
     GotoXY(x, y);
+    WaitForMoveComplete();
 } // End RotatedGotoXY().
 
 
@@ -1679,11 +1803,15 @@ inline uint_fast16_t ReadAPot(int pot)
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateLeds()
 {
+    // Create a filter for our brightness knob values.
+    static LowPassFilter filter(0.000001);
+
     // Only read the left BRIGHTNESS pot if we're not being controlled remotely.
     if (!RemoteBrightness)
     {
-        // The pot on the left is for the LEDs.  Read it now.
+        // The pot on the left is for the LEDs.  Read it now and average its value.
         uint_fast16_t brightnessKnobVal = ReadAPot(BRIGHTNESS_POT_PIN);
+        Brightness = lroundf(filter.AddSample((float_t)brightnessKnobVal));
         Brightness = map(brightnessKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
     }
@@ -1704,11 +1832,16 @@ void UpdateLeds()
 /////////////////////////////////////////////////////////////////////////////////
 void UpdateSpeeds()
 {
+    // Create a filter for our speed knob values.
+    static LowPassFilter filter(0.000001);
+
     // Only read the right SPEED pot if we're not being controlled remotely.
     if (!RemoteSpeedDelay)
     {
-        // Pot on the right is for drawing speed or delay.  Read it now.
+        // Pot on the right is for drawing speed or delay.  Read it now and
+        // average its value.
         uint_fast16_t speedKnobVal = ReadAPot(SPEED_POT_PIN);
+        SpeedDelay = lroundf(filter.AddSample((float_t)speedKnobVal));
         SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
     }
@@ -2831,6 +2964,7 @@ void WhirlFlower(uint_fast16_t numSides, uint_fast16_t size, float_t rotation,
     if (!AbortShape)
     {
         GotoXY(0.0, 0.0);
+        WaitForMoveComplete();
     }
 
     EndSeries();
@@ -3585,7 +3719,10 @@ void LogExecutionStats()
     uint32_t hours = seconds / 3600;
     uint32_t minutes = (seconds / 60) % 60;
     seconds  %= 60;
-    LOG_F(LOG_ALWAYS, "Up Time: %2d:%02d:%02d\n", hours, minutes, seconds);
+    LOG_F(LOG_ALWAYS, "\nUp Time     : %2d:%02d:%02d\n", hours, minutes, seconds);
+    LOG_F(LOG_ALWAYS, "Random Seed : %u\n\n", RandomSeed);
+    LOG_F(LOG_ALWAYS, "  # Ex. Prob.  Shape\n");
+    LOG_F(LOG_ALWAYS, "============================================\n");
 
     // Loop through each shape and display its execution count.
     uint_fast32_t total = 0;
@@ -3593,11 +3730,11 @@ void LogExecutionStats()
     {
         uint_fast32_t count = RandomShapes[i].GetCount();
         total += count;
-        LOG_F(LOG_ALWAYS, "%5d   %1.4f   %s\n",
-              count, Probabilities[i], RandomShapes[i].GetName());
+        LOG_F(LOG_ALWAYS, "%5d   %1.2f   %s\n",
+              count, 100.0 * Probabilities[i], RandomShapes[i].GetName());
     }
     // Display the total number of shapes that have been produced.
-    LOG_F(LOG_ALWAYS, "%5d   TOTAL\n", total);
+    LOG_F(LOG_ALWAYS, "%5d   TOTAL\n\n", total);
 } // End LogExecutionStats().
 
 
@@ -3838,7 +3975,7 @@ void setup()
     StartupTicks = xTaskGetTickCount();
 
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // !!!NOTE:  MUST NOT CALL vTaskStartScheduler() OR SYSTEM WILL CRASH!!!
+    // !!! NOTE:  MUST NOT CALL vTaskStartScheduler() OR SYSTEM WILL CRASH!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 } // End setup().
 
