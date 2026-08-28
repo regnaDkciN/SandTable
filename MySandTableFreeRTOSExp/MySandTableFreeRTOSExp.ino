@@ -22,6 +22,8 @@
 //
 // History:
 // - 28-AUG-2026 JMC
+//   - Fixed pot scaling issue.  Was not applying low pass filter.
+// - 28-AUG-2026 JMC
 //   - Reworked home() operation to reduce strain on the servos.
 //   - Added missing WaitForMoveComplete() calls after GotoXY().  Was causing
 //     lockup after WhirlFlower() followed by MotorRatios() call.
@@ -1804,14 +1806,14 @@ inline uint_fast16_t ReadAPot(int pot)
 void UpdateLeds()
 {
     // Create a filter for our brightness knob values.
-    static LowPassFilter filter(0.000001);
+    static LowPassFilter filter(0.01);
 
     // Only read the left BRIGHTNESS pot if we're not being controlled remotely.
     if (!RemoteBrightness)
     {
         // The pot on the left is for the LEDs.  Read it now and average its value.
         uint_fast16_t brightnessKnobVal = ReadAPot(BRIGHTNESS_POT_PIN);
-        Brightness = lroundf(filter.AddSample((float_t)brightnessKnobVal));
+        brightnessKnobVal = lroundf(filter.AddSample((float_t)brightnessKnobVal));
         Brightness = map(brightnessKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          BRIGHTNESS_MIN_VAL, BRIGHTNESS_MAX_VAL);
     }
@@ -1833,7 +1835,7 @@ void UpdateLeds()
 void UpdateSpeeds()
 {
     // Create a filter for our speed knob values.
-    static LowPassFilter filter(0.000001);
+    static LowPassFilter filter(0.01);
 
     // Only read the right SPEED pot if we're not being controlled remotely.
     if (!RemoteSpeedDelay)
@@ -1841,7 +1843,7 @@ void UpdateSpeeds()
         // Pot on the right is for drawing speed or delay.  Read it now and
         // average its value.
         uint_fast16_t speedKnobVal = ReadAPot(SPEED_POT_PIN);
-        SpeedDelay = lroundf(filter.AddSample((float_t)speedKnobVal));
+        speedKnobVal = lroundf(filter.AddSample((float_t)speedKnobVal));
         SpeedDelay = map(speedKnobVal, KNOB_MIN_VAL, KNOB_MAX_VAL,
                          SPEED_DELAY_MAX_VAL,  SPEED_DELAY_MIN_VAL);
     }
