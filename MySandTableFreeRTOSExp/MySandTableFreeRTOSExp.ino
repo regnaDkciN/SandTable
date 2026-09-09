@@ -21,6 +21,11 @@
 //   - Many more changes to fix anomalous behavior and enhance operation.
 //
 // History:
+// - 08-SEP-2026 JMC
+//   - Changed Coordinate types to int_fast8_t.
+//   - Fixed bug which caused catastrophic failure on ServoControlTask() timeout.
+//     Was breaking out of the task's while loop and returning from the task
+//     which must never be done, and caused board to lock up.
 // - 28-AUG-2026 JMC
 //   - Fixed pot scaling issue.  Was not applying low pass filter.
 // - 28-AUG-2026 JMC
@@ -433,13 +438,13 @@ bool    WaitForMoveComplete();
 /////////////////////////////////////////////////////////////////////////////////
 struct Coordinate
 {
-    Coordinate(int_least8_t px, int_least8_t py)
+    Coordinate(int_fast8_t px, int_fast8_t py)
     {
         x = px;
         y = py;
     }
-    int_least8_t x;   // X coordinate.
-    int_least8_t y;   // Y coordinate.
+    int_fast8_t x;   // X coordinate.
+    int_fast8_t y;   // Y coordinate.
 }; // End Coordinate.
 
 
@@ -1657,21 +1662,28 @@ void ServoControlTask(__unused void *param)
 
                 // Wait until the target is reached. Force the current move to
                 // end and log an error on timeout.
-                if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(SERVO_TIMEOUT_MS)) != pdTRUE)
+                while (1)
                 {
-                    // Seems to be stuck.  Force the current move to end.
-                    InOutOn = false;
-                    RotOn = false;
-                    InOutStepsTo = InOutSteps;
-                    RotStepsTo = RotSteps;
-                    CalculateXY();
+                    if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(SERVO_TIMEOUT_MS)) != pdTRUE)
+                    {
+                        // We timed out.  If we're pausing, then continue waiting.
+                        if (Pausing)
+                        {
+                            continue;
+                        }
+                        // Seems to be stuck.  Force the current move to end.
+                        InOutOn = false;
+                        RotOn = false;
+                        InOutStepsTo = InOutSteps;
+                        RotStepsTo = RotSteps;
+                        CalculateXY();
 
-                    LOG_F(LOG_ALWAYS, "!!! Timeout waiting for move to complete.\n");
+                        LOG_F(LOG_ALWAYS, "!!! Timeout waiting for move to complete.\n");
 
-                    // Something has gone terribly wrong.  Attempt to recover
-                    // by aborting the current move.
-                    AbortShape = true;
-
+                        // Something has gone terribly wrong.  Attempt to recover
+                        // by aborting the current move.
+                        AbortShape = true;
+                    }
                     break;
                 }
             }
