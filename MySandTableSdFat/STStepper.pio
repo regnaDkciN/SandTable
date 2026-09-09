@@ -1,0 +1,153 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; STStepper.pio
+;
+; This file contains a Raspberry Pi RP2040/2350 PIO state machine and associated
+; code to handle stepping of servo motors.  The original use of this code was
+; for a the sand table described at Instructables:
+; https://www.instructables.com/Worlds-First-Cycloid-Art-Table-How-I-Built-This-Ar/
+; with updates and Adafruit Metro RP2350 implementation described here:
+; https://github.com/regnaDkciN/SandTable .
+; When the sand table RP2350 implementation's servo microstepping changed from 8
+; microsteps to 64, the interrupt service rate also increased by a factor of 8.
+; That is, at the fastest servo rate, each servo ISR went from being handled
+; every 100 microseconds (uSec) to 12.5 uSec.  The RP2350 could still handle
+; this rate, but with littl margin for error.  This driver solves 3 problem:
+;   - It allows the servo update rate to be cut in half since it handles toggling
+;     the servo step pin both high and low in one operation.  The original driver
+;     required the ISR to be called twice as often - once to toggle the step pin
+;     high, and once to toggle the step pin low.
+;   - It enforces a minimum of 13 uSecs between consecutive steps.  In the
+;     sand table design the in/out servo is driven by both the in/out ISR and the
+;     rotary ISR.  In some cases in/out pulses could be generated with almost no
+;     time between consecutive steps.  In these cases, the servo could not
+;     respond at such speeds, and servo posiion was lost.
+;   - It cuts down on the number of writes to the servo's direction pin since
+;     it is now only written just before a step is executed.
+;
+; The C++ code provides a class that simplifies setup and use of multiple servos.
+; The user need only instantiate an STStepper object with direction pin, step
+; pin, and frequency argumants.  Then to step the servo, a call to Step() with
+; a direction argument is used.
+;
+; A Step() call will generate pulses on the servo driver's direction and step
+; pins as follows:
+;   1. The direction pin is set per the Step() direction argument.
+;   2. Delay 1 uSec.
+;   3. The step pin is toggled high.
+;   4. Delay 6 uSec.
+;   5. The step pin is toggled low.
+;   6  Delay 6 uSec.
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+.program ststepper
+
+.side_set 1
+
+    nop        side 0 [5]   ; Set step pin low.
+    out pins 1 side 0       ; Set direction pin.
+    nop        side 1 [5]   ; Set step pin high.
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// STStepper class
+//
+// Simplifies multiple servo setup and stepping.
+/////////////////////////////////////////////////////////////////////////////////
+class STStepper
+{
+public:
+    /////////////////////////////////////////////////////////////////////////////
+    // Constructor
+    //
+    // Creates a PIO state machine and gets it ready for use.
+    //
+    // Arguments:
+    //   dirPin  - the GPIO pin number used for setting the servo direction.
+    //   stepPin - the GPIO pin number used for stepping the servo.
+    //   freq    - the state machine frequency.  Normally 1,000,000.0.
+    /////////////////////////////////////////////////////////////////////////////
+    STStepper(int dirPin, int stepPin, float freq = 1000000.0)
+    {
+        pio_claim_free_sm_and_add_program(&ststepper_program, &m_Pio, &m_Sm, &m_Offset);
+        Init(dirPin, stepPin, freq);
+    } // End Constructor.
+
+    /////////////////////////////////////////////////////////////////////////////
+    // Destructor
+    /////////////////////////////////////////////////////////////////////////////
+    ~STStepper()
+    {
+        pio_remove_program(m_Pio, &ststepper_program, m_Offset);
+    } // End Destructor.
+
+    /////////////////////////////////////////////////////////////////////////////
+    // Step()
+    //
+    // Steps the servo in the specified direction.
+    //
+    // Arguments:
+    //   dir - the direction to step (1 or 0).
+    /////////////////////////////////////////////////////////////////////////////
+    void Step(uint dir)
+    {
+        pio_sm_put_blocking(m_Pio, m_Sm, dir);
+    } // End Step().
+
+private:
+    // We don't want to create a default object, nor do we want to copy one.
+    STStepper();
+    STStepper(const STStepper &);
+    STStepper &operator=(const STStepper &);
+
+    /////////////////////////////////////////////////////////////////////////////
+    // Init()
+    //
+    // Initializes the state machine and starts it running.
+    //
+    // Arguments:
+    //   dirPin  - the GPIO pin number used for setting the servo direction.
+    //   stepPin - the GPIO pin number used for stepping the servo.
+    //   freq    - the state machine frequency.  Normally 1,000,000.0.
+    /////////////////////////////////////////////////////////////////////////////
+    void Init(uint dirPin, uint stepPin, float freq)
+    {
+        // Set up the GPIO pins.
+        pio_sm_set_pins_with_mask(m_Pio, m_Sm, 0, (1u << dirPin) | (1u << stepPin));
+        pio_sm_set_pindirs_with_mask(m_Pio, m_Sm, ~0u, (1u << dirPin) | (1u << stepPin));
+        pio_gpio_init(m_Pio, dirPin);
+        pio_gpio_init(m_Pio, stepPin);
+
+        // Configure the state machine.
+        pio_sm_config c = ststepper_program_get_default_config(m_Offset);
+        sm_config_set_out_pins(&c, dirPin, 1);
+        sm_config_set_sideset_pins(&c, stepPin);
+
+        // Shift to right, autopull with threshold 1.
+        sm_config_set_out_shift(&c, true, true, 1);
+
+        // Deeper FIFO (8) as we're not doing any RX.
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+        // Init the state machine frequency.
+        float div = (float)clock_get_hz(clk_sys) / freq;
+        sm_config_set_clkdiv(&c, div);
+
+        // Start up the state machine.
+        pio_sm_init(m_Pio, m_Sm, m_Offset, &c);
+        pio_sm_set_enabled(m_Pio, m_Sm, true);
+    } // End Init().
+
+    // Object variables
+    PIO  m_Pio;         // PIO object number.
+    uint m_Sm;          // State machine number.
+    uint m_Offset;      // State machine offset.
+}; // End STStepper class.
+
+
+%}
+
