@@ -1,3 +1,11 @@
+# **NOTE:** 
+This GIT archive contains several versions of the sand table described within this document.  Each version contains different hardware and firmware capabilities.  The versions are:
+* **MySandTable** - This was the original version and is described fully in this readme file.  It used the original Arduino board.
+* **MySandTable2350** - This version upgraded to use the Adafruit Metro 2350 board.  This version contains many upgrades from the original.
+* **MySandTableFreeRTOS** - This version uses the Adafruit Metro 2350 and adds FreeRTOS support.
+* **MySandTableFreeRTOSExp** - This was originally an experimental version, hence the name, but has become the  main development version.  It has many upgrades and fixes many bugs.
+* **MySandTableSdFat** -This version adds access to the Metro 2350 board's SD card.  It allows for placing new shape files in the SD and randomly selects files to shape execute.
+
 # Sand Table
 ![Sand Table](https://i.imgur.com/tNOBlu8.jpeg)
 I have always been interested in sand tables, but most required more carpentry work than I could handle, and were too expensive for my budget.  Then I came across  the Instructable of [<u>World's First Cycloid Art Table: How I Built This Arduino-Powered Spirograph Machine</u> by NewsonsElectronics](https://www.instructables.com/Worlds-First-Cycloid-Art-Table-How-I-Built-This-Ar/).  This was finally a reasonable design that I could handle.
